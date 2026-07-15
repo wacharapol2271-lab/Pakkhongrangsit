@@ -3735,7 +3735,7 @@ function buildMenuFooter() {
 function buildMenuCarouselFlex() {
   return {
     type: 'flex',
-    altText: 'เมนูคำสั่ง MEGABOT',
+    altText: 'MENU NANA',
     contents: {
       type: 'carousel',
       contents: [
@@ -3750,7 +3750,7 @@ function buildMenuCarouselFlex() {
             contents: [
               {
                 type: 'text',
-                text: '⚠️ คำเตือนการค้นหา',
+                text: '⚠️ WARNING',
                 color: '#FFFFFF',
                 weight: 'bold',
                 size: 'lg'
@@ -3792,7 +3792,7 @@ function buildMenuCarouselFlex() {
             contents: [
               {
                 type: 'text',
-                text: '📂 MEGABOT 1/5',
+                text: '📂 NANABOT 1/5',
                 color: '#FFFFFF',
                 weight: 'bold',
                 size: 'lg'
@@ -3848,7 +3848,7 @@ function buildMenuCarouselFlex() {
             contents: [
               {
                 type: 'text',
-                text: '📂 MEGABOT 2/5',
+                text: '📂 NANABOT 2/5',
                 color: '#FFFFFF',
                 weight: 'bold',
                 size: 'lg'
@@ -3905,7 +3905,7 @@ function buildMenuCarouselFlex() {
             contents: [
               {
                 type: 'text',
-                text: '📂 MEGABOT 3/5',
+                text: '📂 NANABOT 3/5',
                 color: '#FFFFFF',
                 weight: 'bold',
                 size: 'lg'
@@ -3959,7 +3959,7 @@ function buildMenuCarouselFlex() {
             contents: [
               {
                 type: 'text',
-                text: '📂 MEGABOT 4/5',
+                text: '📂 NANABOT 4/5',
                 color: '#FFFFFF',
                 weight: 'bold',
                 size: 'lg'
@@ -4021,7 +4021,7 @@ function buildMenuCarouselFlex() {
             contents: [
               {
                 type: 'text',
-                text: '📂 MEGABOT 5/5',
+                text: '📂 NANABOT 5/5',
                 color: '#FFFFFF',
                 weight: 'bold',
                 size: 'lg'
@@ -4065,7 +4065,7 @@ function buildMenuCarouselFlex() {
                 '• 34 บรรทุกไม่ประจำทาง',
                 '• 35 บรรทุกส่วนบุคคล'
               ]),
-              menuSection('⚠️ คำสั่งที่มีการปรับปรุง', [
+              menuSection('🚨Improvement system ', [
                 '• a#',
                 '• fx#'
               ])
@@ -5268,7 +5268,7 @@ color:'#22C55E'
 
 {
 type:'text',
-text:'MEGABOT SERVER',
+text:'NANABOT SERVER',
 align:'center',
 margin:'md',
 size:'xs',
