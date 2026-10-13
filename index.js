@@ -4,6 +4,13 @@ const line = require('@line/bot-sdk');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const session = require('express-session');
+const multer = require('multer');
+const UNWIREDLABS_TOKEN = process.env.UNWIREDLABS_TOKEN;
+
+const UNWIREDLABS_URL =
+  'https://ap1.unwiredlabs.com/v2/process.php';
+const GOOGLE_GEO_API_KEY = process.env.GOOGLE_GEO_API_KEY;
 const SEARCH_LOG_FILE = path.join(__dirname, 'search_logs.json');
 const supportSlipSessions = {};
 const cheerio = require('cheerio');
@@ -13,35 +20,524 @@ const crypto = require('crypto');
 const IAPP_API_KEY = 'iapp_live_ccd35e461ddb1ba1f44096afde50cff5118c2013eb30491047d7a5cd69dcc443';
 const faceCompareSessions = {};
 const plateOcrSessions = {};
+const baseRequestSessions = {};
 const PHISHING_LOG_API_KEY = 'api_fXLDx9XVRsF6sRZ3cBUDxWJVjLzD40jy';
-const PHISHING_LOG_DOMAIN = 'go.onlinematichornonline.com';
+const PHISHING_LOG_DOMAIN = 'ruay.ufabet996.com';
 const phishingLoggerMap = {};
 
-function saveSearchLog(userId, lineName, text) {
+// =====================================
+// ATM DATABASE
+// =====================================
+
+const ATM_DATA_FILE =
+  path.join(
+    __dirname,
+    'atm_locations.json'
+  );
+
+let ATM_DATABASE = null;
+
+function loadAtmDatabase() {
+
+  if (ATM_DATABASE) {
+    return ATM_DATABASE;
+  }
+
+  try {
+
+    const raw =
+      fs.readFileSync(
+        ATM_DATA_FILE,
+        'utf8'
+      );
+
+    const json =
+      JSON.parse(raw);
+
+    ATM_DATABASE =
+      Array.isArray(json)
+        ? json
+        : Array.isArray(json.records)
+          ? json.records
+          : [];
+
+    console.log(
+      '✅ ATM DATABASE:',
+      ATM_DATABASE.length,
+      'records'
+    );
+
+    return ATM_DATABASE;
+
+  } catch (err) {
+
+    console.error(
+      '❌ ATM DATABASE ERROR:',
+      err.message
+    );
+
+    ATM_DATABASE = [];
+
+    return ATM_DATABASE;
+  }
+}
+
+// =====================================
+// SEARCH ATM DATABASE
+// =====================================
+
+function normalizeAtmCode(value) {
+  return String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '');
+}
+
+
+function searchAtmDatabase(keyword) {
+
+  const database =
+    loadAtmDatabase();
+
+  const input =
+    String(keyword || '').trim();
+
+
+  if (!input) {
+    return [];
+  }
+
+
+  let bankCode = '';
+  let atmCode = input;
+
+
+  // รองรับรูปแบบ:
+  // atm%014/0005
+  if (input.includes('/')) {
+
+    const parts =
+      input.split('/');
+
+    bankCode =
+      String(parts.shift() || '')
+        .trim();
+
+    atmCode =
+      parts.join('/')
+        .trim();
+  }
+
+
+  // ปรับรหัสธนาคาร
+  if (/^\d+$/.test(bankCode)) {
+
+    bankCode =
+      bankCode.padStart(3, '0');
+  }
+
+
+  const searchCode =
+    normalizeAtmCode(atmCode);
+
+
+  // กรณีเป็นตัวเลข
+  // เช่น 5 ให้ค้นเจอ 0005
+  const numericSearch =
+    /^\d+$/.test(searchCode)
+      ? searchCode.replace(
+          /^0+(?=\d)/,
+          ''
+        )
+      : null;
+
+
+  return database.filter(item => {
+
+    // =========================
+    // ถ้าระบุรหัสธนาคาร
+    // =========================
+
+    if (bankCode) {
+
+      const itemBankCode =
+        String(
+          item?.bankCode || ''
+        )
+          .trim()
+          .padStart(3, '0');
+
+
+      if (
+        itemBankCode !== bankCode
+      ) {
+        return false;
+      }
+    }
+
+
+    // =========================
+    // ตรวจรหัสตู้
+    // =========================
+
+    const itemCode =
+      normalizeAtmCode(
+        item?.atmCode
+      );
+
+
+    // ตรงกันแบบเต็ม
+    if (
+      itemCode === searchCode
+    ) {
+      return true;
+    }
+
+
+    // กรณีเลข
+    // 5 = 0005
+    if (
+      numericSearch !== null &&
+      /^\d+$/.test(itemCode)
+    ) {
+
+      const numericItem =
+        itemCode.replace(
+          /^0+(?=\d)/,
+          ''
+        );
+
+
+      return (
+        numericItem ===
+        numericSearch
+      );
+    }
+
+
+    return false;
+  });
+}
+
+
+// =====================================
+// FORMAT ATM RESULT
+// =====================================
+
+function formatAtmSearchResult(
+  results,
+  keyword
+) {
+
+  if (
+    !Array.isArray(results) ||
+    results.length === 0
+  ) {
+
+    return (
+`🏧 ข้อมูลตู้ ATM
+
+🔎 ค้นหา : ${keyword}
+
+❌ ไม่พบข้อมูลตู้ ATM`
+    );
+  }
+
+
+  const items =
+    results.map(
+      (item, index) => {
+
+        const lines = [];
+
+
+        lines.push(
+          `📂 รายการที่ ${index + 1}`
+        );
+
+
+        lines.push(
+          `🏦 ธนาคาร : ${
+            item.bankName || '-'
+          }`
+        );
+
+
+        lines.push(
+          `🔢 รหัสธนาคาร : ${
+            item.bankCode || '-'
+          }`
+        );
+
+
+        lines.push(
+          `🏧 รหัสตู้ : ${
+            item.atmCode || '-'
+          }`
+        );
+
+
+        if (item.location) {
+
+          lines.push(
+            `📍 จุดติดตั้ง : ${item.location}`
+          );
+        }
+
+
+        if (item.branch) {
+
+          lines.push(
+            `🏢 สาขา : ${item.branch}`
+          );
+        }
+
+
+        if (item.branchCode) {
+
+          lines.push(
+            `🔖 รหัสสาขา : ${item.branchCode}`
+          );
+        }
+
+
+        if (item.address) {
+
+          lines.push(
+            `🏠 ที่อยู่ : ${item.address}`
+          );
+        }
+
+
+        if (item.subdistrict) {
+
+          lines.push(
+            `📌 ตำบล/แขวง : ${item.subdistrict}`
+          );
+        }
+
+
+        if (item.district) {
+
+          lines.push(
+            `📌 อำเภอ/เขต : ${item.district}`
+          );
+        }
+
+
+        if (item.province) {
+
+          lines.push(
+            `🗺️ จังหวัด : ${item.province}`
+          );
+        }
+
+
+        if (item.postcode) {
+
+          lines.push(
+            `📮 รหัสไปรษณีย์ : ${item.postcode}`
+          );
+        }
+
+
+        if (item.machineType) {
+
+          lines.push(
+            `⚙️ ประเภทเครื่อง : ${item.machineType}`
+          );
+        }
+
+
+        if (item.installDate) {
+
+          lines.push(
+            `📅 วันที่ติดตั้ง : ${item.installDate}`
+          );
+        }
+
+
+        return lines.join('\n');
+      }
+    )
+      .join(
+        '\n\n-  -  -  -  -  -  -  -\n\n'
+      );
+
+
+  const resultText =
+`🏧 ข้อมูลตู้ ATM
+
+🔎 ค้นหา : ${keyword}
+✅ พบทั้งหมด ${results.length} รายการ
+
+-  -  -  -  -  -  -  -
+
+${items}`;
+
+
+  return limitLineMessage(
+    resultText
+  );
+}
+
+async function lookupUnwiredCell({ radio, mcc, mnc, lac, cid }) {
+  try {
+    const payload = {
+      token: UNWIREDLABS_TOKEN,
+      radio: radio,
+      mcc: Number(mcc),
+      mnc: Number(mnc),
+      cells: [
+        {
+          lac: Number(lac),
+          cid: Number(cid),
+          psc: 0
+        }
+      ],
+      address: 1
+    };
+
+    const response = await axios.post(
+      UNWIREDLABS_URL,
+      payload,
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000
+      }
+    );
+
+    return response.data;
+
+  } catch (error) {
+    console.error(
+      'Unwired Labs API error:',
+      error.response?.data || error.message
+    );
+
+    throw error;
+  }
+}
+
+async function autoLookupUnwiredCell(mcc, mnc, lac, cid) {
+  const radios = ['umts', 'lte'];
+
+  let lastResult = null;
+
+  for (const radio of radios) {
+    try {
+      const result = await lookupUnwiredCell({
+        radio,
+        mcc,
+        mnc,
+        lac,
+        cid
+      });
+
+      lastResult = result;
+
+      if (
+        result &&
+        result.status === 'ok' &&
+        Number.isFinite(Number(result.lat)) &&
+        Number.isFinite(Number(result.lon))
+      ) {
+        return {
+          ...result,
+          radioUsed: radio
+        };
+      }
+
+    } catch (error) {
+      console.log(
+        `Unwired Labs ${radio} lookup failed:`,
+        error.message
+      );
+    }
+  }
+
+  return lastResult;
+}
+
+function saveSearchLog(
+  userId,
+  lineName,
+  text,
+  source = 'line',
+  details = []
+) {
+
   let logs = [];
 
   try {
-    logs = JSON.parse(
-      fs.readFileSync(SEARCH_LOG_FILE, 'utf8')
-    );
+
+    logs =
+      JSON.parse(
+        fs.readFileSync(
+          SEARCH_LOG_FILE,
+          'utf8'
+        )
+      );
+
   } catch {
+
     logs = [];
+
   }
 
-  logs.unshift({
-    userId,
-    lineName,
-    text,
-    time: new Date().toISOString()
-  });
 
-  logs = logs.slice(0, 10000);
+  logs.unshift({
+  userId,
+  lineName,
+  text,
+  source,
+
+  details:
+    Array.isArray(details)
+      ? details
+      : [],
+
+  time:
+    new Date().toISOString()
+});
+
+
+  logs =
+    logs.slice(
+      0,
+      10000
+    );
+
 
   fs.writeFileSync(
     SEARCH_LOG_FILE,
-    JSON.stringify(logs, null, 2),
+    JSON.stringify(
+      logs,
+      null,
+      2
+    ),
     'utf8'
   );
+}
+
+async function googleCellGeo(mcc, mnc, lac, cid) {
+  const res = await axios.post(
+    `https://www.googleapis.com/geolocation/v1/geolocate?key=${GOOGLE_GEO_API_KEY}`,
+    {
+      cellTowers: [
+        {
+          mobileCountryCode: Number(mcc),
+          mobileNetworkCode: Number(mnc),
+          locationAreaCode: Number(lac),
+          cellId: Number(cid)
+        }
+      ]
+    }
+  );
+
+  return res.data;
 }
 
 async function searchHospital(keyword) {
@@ -233,12 +729,11476 @@ const app = express();
 const CHANNEL_ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN;
 const CHANNEL_SECRET = process.env.CHANNEL_SECRET;
 const PORT = process.env.PORT || 3000;
+
 const BASE_URL = (process.env.BASE_URL || '').replace(/\/$/, '');
+
+// ==============================
+// LINE LOGIN CONFIG
+// ==============================
+const LINE_LOGIN_CHANNEL_ID =
+  process.env.LINE_LOGIN_CHANNEL_ID;
+
+const LINE_LOGIN_CHANNEL_SECRET =
+  process.env.LINE_LOGIN_CHANNEL_SECRET;
+
+const LINE_LOGIN_CALLBACK_URL =
+  process.env.LINE_LOGIN_CALLBACK_URL ||
+  `${BASE_URL}/line/callback`;
+
+const WEB_SESSION_SECRET =
+  process.env.WEB_SESSION_SECRET ||
+  'change-this-secret';
 
 const ADMIN_IDS = (process.env.LINE_ADMIN_USER_IDS || '')
   .split(',')
   .map(v => v.trim())
   .filter(Boolean);
+
+// ==============================
+// WEB SESSION สำหรับ LINE LOGIN
+// ==============================
+app.set('trust proxy', 1);
+
+const webSession = session({
+  secret: WEB_SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 30 * 60 * 1000
+  }
+});
+
+app.use('/line', webSession);
+app.use('/register', webSession);
+app.use('/member', webSession);
+app.use('/signal', webSession);
+app.use('/support', webSession);
+app.use('/moneyflow', webSession);
+
+// ==============================
+// REGISTER UPLOAD
+// ==============================
+const registerUploadDir = path.join(__dirname, 'uploads', 'register');
+
+if (!fs.existsSync(registerUploadDir)) {
+  fs.mkdirSync(registerUploadDir, { recursive: true });
+}
+
+const registrationUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      cb(null, registerUploadDir);
+    },
+
+    filename: (req, file, cb) => {
+      const ext =
+        file.mimetype === 'image/png'
+          ? '.png'
+          : '.jpg';
+
+      const randomName =
+        crypto.randomBytes(12).toString('hex');
+
+      cb(
+        null,
+        `member_${Date.now()}_${randomName}${ext}`
+      );
+    }
+  }),
+
+  limits: {
+    fileSize: 5 * 1024 * 1024
+  },
+
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png'
+    ];
+
+    if (!allowedTypes.includes(file.mimetype)) {
+      return cb(
+        new Error('รองรับเฉพาะไฟล์ JPG และ PNG')
+      );
+    }
+
+    cb(null, true);
+  }
+});
+
+// ==============================
+// SIGNAL REQUEST PRIVATE UPLOAD
+// ==============================
+
+const signalStorageRoot =
+  process.env.STORAGE_ROOT ||
+  process.env.DATA_DIR ||
+  __dirname;
+
+const signalRequestUploadDir =
+  path.join(
+    signalStorageRoot,
+    'private_uploads',
+    'signal_requests'
+  );
+
+if (!fs.existsSync(signalRequestUploadDir)) {
+  fs.mkdirSync(
+    signalRequestUploadDir,
+    { recursive: true }
+  );
+}
+
+const signalRequestUpload = multer({
+
+  storage: multer.diskStorage({
+
+    destination: (req, file, cb) => {
+      cb(null, signalRequestUploadDir);
+    },
+
+    filename: (req, file, cb) => {
+
+      const ext =
+        file.mimetype === 'image/png'
+          ? '.png'
+          : '.jpg';
+
+      const randomName =
+        crypto
+          .randomBytes(16)
+          .toString('hex');
+
+      cb(
+        null,
+        `signal_${Date.now()}_${randomName}${ext}`
+      );
+    }
+
+  }),
+
+  limits: {
+    fileSize: 8 * 1024 * 1024
+  },
+
+  fileFilter: (req, file, cb) => {
+
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png'
+    ];
+
+    if (!allowedTypes.includes(file.mimetype)) {
+      return cb(
+        new Error(
+          'รองรับเฉพาะไฟล์ JPG และ PNG'
+        )
+      );
+    }
+
+    cb(null, true);
+  }
+
+});
+
+// =====================================
+// MEMBER SUPPORT
+// =====================================
+
+const SUPPORT_PACKAGES = {
+  '30': {
+    days: 30,
+    amount: 499,
+    label: '30 วัน'
+  },
+
+  '90': {
+    days: 90,
+    amount: 1299,
+    label: '90 วัน'
+  },
+
+  '180': {
+    days: 180,
+    amount: 2500,
+    label: '180 วัน'
+  },
+
+  '365': {
+    days: 365,
+    amount: 4999,
+    label: '365 วัน'
+  }
+};
+
+
+const supportUploadDir =
+  path.join(
+    process.env.STORAGE_ROOT ||
+    process.env.DATA_DIR ||
+    __dirname,
+    'private_uploads',
+    'support_slips'
+  );
+
+
+if (!fs.existsSync(supportUploadDir)) {
+  fs.mkdirSync(
+    supportUploadDir,
+    { recursive: true }
+  );
+}
+
+
+const supportUpload = multer({
+
+  storage: multer.diskStorage({
+
+    destination: (req, file, cb) => {
+      cb(null, supportUploadDir);
+    },
+
+    filename: (req, file, cb) => {
+
+      const ext =
+        file.mimetype === 'image/png'
+          ? '.png'
+          : '.jpg';
+
+      const randomName =
+        crypto
+          .randomBytes(16)
+          .toString('hex');
+
+      cb(
+        null,
+        `support_${Date.now()}_${randomName}${ext}`
+      );
+    }
+
+  }),
+
+  limits: {
+    fileSize: 8 * 1024 * 1024
+  },
+
+  fileFilter: (req, file, cb) => {
+
+    const allowed = [
+      'image/jpeg',
+      'image/png'
+    ];
+
+    if (!allowed.includes(file.mimetype)) {
+      return cb(
+        new Error(
+          'รองรับเฉพาะไฟล์ JPG และ PNG'
+        )
+      );
+    }
+
+    cb(null, true);
+  }
+
+});
+
+// =====================================
+// MEMBER SUPPORT PAGE
+// =====================================
+app.get('/support', (req, res) => {
+
+  const lineUser =
+    req.session.lineUser;
+
+
+  if (!lineUser?.userId) {
+
+    return res.redirect(
+      '/line/login?next=%2Fsupport'
+    );
+
+  }
+
+
+  const db =
+    loadDB();
+
+
+  db.members =
+    db.members || {};
+
+
+  const member =
+    db.members[
+      lineUser.userId
+    ];
+
+
+  if (!member) {
+
+    return res.status(403).send(
+      '❌ ไม่พบข้อมูลสมาชิก กรุณาลงทะเบียนสมาชิกก่อน'
+    );
+
+  }
+
+
+  const escapeHtml = (value = '') =>
+    String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+
+  const lineName =
+    escapeHtml(
+      member.lineName ||
+      member.displayName ||
+      lineUser.displayName ||
+      '-'
+    );
+
+
+  const uid =
+    escapeHtml(
+      lineUser.userId
+    );
+
+
+  const phone =
+    escapeHtml(
+      member.phone || '-'
+    );
+
+
+  const pictureUrl =
+    lineUser.pictureUrl
+      ? escapeHtml(
+          lineUser.pictureUrl
+        )
+      : '';
+
+
+  const packageHtml =
+    Object.entries(
+      SUPPORT_PACKAGES
+    )
+      .map(
+        ([key, pkg]) => `
+<label class="package-card">
+
+  <input
+    type="radio"
+    name="supportPackage"
+    value="${key}"
+    required
+  >
+
+  <div class="package-content">
+
+    <div>
+
+      <div class="package-days">
+        ${pkg.label}
+      </div>
+
+      <div class="package-desc">
+        เพิ่มสิทธิ์วันใช้งาน / สิทธิ์สืบค้น
+      </div>
+
+    </div>
+
+    <div class="package-price">
+      ${pkg.amount.toLocaleString('th-TH')} ฿
+    </div>
+
+  </div>
+
+</label>
+        `
+      )
+      .join('');
+
+
+  return res.send(`
+<!DOCTYPE html>
+
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+  ระบบสนับสนุนสมาชิก
+</title>
+
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+
+  min-height: 100vh;
+
+  padding: 18px;
+
+  background: #070b11;
+
+  color: #e5e7eb;
+
+  font-family:
+    Arial,
+    Tahoma,
+    sans-serif;
+}
+
+.container {
+  width: 100%;
+  max-width: 580px;
+
+  margin: 15px auto 50px;
+
+  padding: 24px;
+
+  background: #10161f;
+
+  border: 1px solid #293747;
+  border-radius: 22px;
+}
+
+.title {
+  color: #ffffff;
+
+  font-size: 21px;
+  font-weight: bold;
+}
+
+.subtitle {
+  margin-top: 7px;
+
+  color: #94a3b8;
+
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+
+/* PROFILE */
+
+.profile {
+  display: flex;
+  align-items: center;
+
+  gap: 14px;
+
+  margin-top: 20px;
+
+  padding: 15px;
+
+  background: #080d13;
+
+  border: 1px solid #293747;
+  border-radius: 14px;
+}
+
+.avatar {
+  width: 62px;
+  height: 62px;
+
+  border-radius: 50%;
+
+  object-fit: cover;
+
+  background: #1e293b;
+}
+
+.name {
+  color: #ffffff;
+
+  font-size: 16px;
+  font-weight: bold;
+}
+
+.profile-info {
+  margin-top: 4px;
+
+  color: #94a3b8;
+
+  font-size: 10px;
+
+  line-height: 1.6;
+
+  word-break: break-all;
+}
+
+
+/* SECTION */
+
+.divider {
+  border: 0;
+
+  border-top:
+    1px solid #293747;
+
+  margin: 25px 0;
+}
+
+.section-title {
+  margin-bottom: 12px;
+
+  color: #ffffff;
+
+  font-size: 16px;
+  font-weight: bold;
+}
+
+
+/* BANK */
+
+.bank-card {
+  padding: 18px;
+
+  background: #080d13;
+
+  border: 1px solid #334155;
+  border-radius: 14px;
+}
+
+.bank-name {
+  color: #ffffff;
+
+  font-size: 15px;
+  font-weight: bold;
+}
+
+.account-number {
+  margin-top: 12px;
+
+  color: #d7b56d;
+
+  font-size: 23px;
+  font-weight: bold;
+
+  letter-spacing: 1px;
+}
+
+.account-name {
+  margin-top: 7px;
+
+  color: #cbd5e1;
+
+  font-size: 13px;
+}
+
+
+/* PACKAGE */
+
+.package-card {
+  display: block;
+
+  margin-bottom: 10px;
+
+  cursor: pointer;
+}
+
+.package-card input {
+  display: none;
+}
+
+.package-content {
+  display: flex;
+
+  align-items: center;
+  justify-content: space-between;
+
+  gap: 12px;
+
+  padding: 15px;
+
+  background: #080d13;
+
+  border: 1px solid #334155;
+  border-radius: 12px;
+}
+
+.package-card input:checked
++ .package-content {
+  border-color: #d7b56d;
+
+  background: #17140c;
+}
+
+.package-days {
+  color: #ffffff;
+
+  font-size: 14px;
+  font-weight: bold;
+}
+
+.package-desc {
+  margin-top: 4px;
+
+  color: #64748b;
+
+  font-size: 10px;
+}
+
+.package-price {
+  flex-shrink: 0;
+
+  color: #d7b56d;
+
+  font-size: 17px;
+  font-weight: bold;
+}
+
+
+/* UPLOAD */
+
+.upload-box {
+  display: block;
+
+  padding: 25px 15px;
+
+  background: #080d13;
+
+  border: 1px dashed #52657c;
+  border-radius: 13px;
+
+  text-align: center;
+
+  cursor: pointer;
+}
+
+.upload-box input {
+  display: none;
+}
+
+.upload-icon {
+  font-size: 30px;
+}
+
+.upload-title {
+  margin-top: 7px;
+
+  color: #ffffff;
+
+  font-size: 13px;
+  font-weight: bold;
+}
+
+.upload-help {
+  margin-top: 6px;
+
+  color: #64748b;
+
+  font-size: 10px;
+}
+
+.file-name {
+  margin-top: 10px;
+
+  color: #d7b56d;
+
+  font-size: 11px;
+
+  word-break: break-all;
+}
+
+
+/* NOTICE */
+
+.notice {
+  margin-top: 20px;
+
+  padding: 14px;
+
+  background: #0b1720;
+
+  border: 1px solid #23445a;
+  border-radius: 11px;
+
+  color: #94a3b8;
+
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+
+/* BUTTON */
+
+button {
+  width: 100%;
+
+  height: 53px;
+
+  margin-top: 20px;
+
+  border: 0;
+  border-radius: 11px;
+
+  background: #d7b56d;
+
+  color: #111111;
+
+  font-size: 15px;
+  font-weight: bold;
+
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: .45;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<div class="container">
+
+
+  <div class="title">
+
+    💛 ระบบสนับสนุนสมาชิก
+
+  </div>
+
+
+  <div class="subtitle">
+
+    เพิ่มสิทธิ์วันใช้งาน /
+    เพิ่มสิทธิ์สืบค้นข้อมูล
+
+  </div>
+
+
+  <div class="profile">
+
+    ${
+      pictureUrl
+        ? `
+<img
+  class="avatar"
+  src="${pictureUrl}"
+  alt="LINE Profile"
+>
+        `
+        : `
+<div class="avatar"></div>
+        `
+    }
+
+
+    <div>
+
+      <div class="name">
+        ${lineName}
+      </div>
+
+      <div class="profile-info">
+        เบอร์สมาชิก : ${phone}
+      </div>
+
+      <div class="profile-info">
+        UID : ${uid}
+      </div>
+
+    </div>
+
+  </div>
+
+
+  <hr class="divider">
+
+
+  <div class="section-title">
+
+    🏦 ช่องทางสนับสนุน
+
+  </div>
+
+
+  <div class="bank-card">
+
+    <div class="bank-name">
+      🏦 ธนาคาร : กสิกร
+    </div>
+
+    <div class="account-number">
+      223-8-45775-3
+    </div>
+
+    <div class="account-name">
+      TATTHEP KONGTHAP
+    </div>
+
+  </div>
+
+
+  <hr class="divider">
+
+
+  <div class="section-title">
+
+    📅 เลือกระยะเวลาสนับสนุน
+
+  </div>
+
+
+  <form
+    id="supportForm"
+    method="POST"
+    action="/support"
+    enctype="multipart/form-data"
+  >
+
+
+    ${packageHtml}
+
+
+    <hr class="divider">
+
+
+    <div class="section-title">
+
+      🧾 แนบสลิปสนับสนุน
+
+    </div>
+
+
+    <label class="upload-box">
+
+      <input
+        id="slip"
+        type="file"
+        name="slip"
+        accept="image/jpeg,image/png"
+        required
+      >
+
+
+      <div class="upload-icon">
+        📎
+      </div>
+
+
+      <div class="upload-title">
+        อัปโหลดสลิปสนับสนุน
+      </div>
+
+
+      <div class="upload-help">
+        รองรับ JPG / PNG สูงสุด 8 MB
+      </div>
+
+
+      <div
+        id="fileName"
+        class="file-name"
+      >
+      </div>
+
+
+    </label>
+
+
+    <div class="notice">
+
+      ℹ️ หลังจากส่งสลิป
+      ระบบจะแจ้งข้อมูลไปยังผู้ดูแลระบบ
+      เพื่อทำการตรวจสอบ
+
+      <br><br>
+
+      กรุณาตรวจสอบแพ็กเกจ
+      และยอดสนับสนุนให้ถูกต้อง
+      ก่อนส่งข้อมูล
+
+    </div>
+
+
+    <button
+      id="submitButton"
+      type="submit"
+    >
+
+      📤 ส่งสลิปสนับสนุน
+
+    </button>
+
+
+  </form>
+
+
+</div>
+
+
+<script>
+
+const slip =
+  document.getElementById('slip');
+
+const fileName =
+  document.getElementById(
+    'fileName'
+  );
+
+
+if (
+  slip &&
+  fileName
+) {
+
+  slip.addEventListener(
+    'change',
+    function () {
+
+      if (
+        this.files &&
+        this.files.length
+      ) {
+
+        fileName.textContent =
+          'ไฟล์ที่เลือก : ' +
+          this.files[0].name;
+
+      } else {
+
+        fileName.textContent = '';
+
+      }
+
+    }
+  );
+
+}
+
+
+const supportForm =
+  document.getElementById(
+    'supportForm'
+  );
+
+const submitButton =
+  document.getElementById(
+    'submitButton'
+  );
+
+
+if (
+  supportForm &&
+  submitButton
+) {
+
+  supportForm.addEventListener(
+    'submit',
+    function () {
+
+      submitButton.disabled =
+        true;
+
+      submitButton.textContent =
+        '⏳ กำลังส่งสลิป...';
+
+    }
+  );
+
+}
+
+</script>
+
+
+</body>
+
+</html>
+  `);
+
+});
+
+// =====================================
+// MEMBER SUPPORT SUBMIT
+// =====================================
+app.post('/support', (req, res) => {
+
+  supportUpload.single('slip')(
+    req,
+    res,
+    async (uploadErr) => {
+
+      const deleteSlip = () => {
+
+        if (req.file?.path) {
+
+          fs.unlink(
+            req.file.path,
+            () => {}
+          );
+
+        }
+
+      };
+
+
+      try {
+
+        if (uploadErr) {
+
+          return res.status(400).send(
+            '❌ อัปโหลดสลิปไม่สำเร็จ: ' +
+            uploadErr.message
+          );
+
+        }
+
+
+        const lineUser =
+          req.session.lineUser;
+
+
+        if (!lineUser?.userId) {
+
+          deleteSlip();
+
+          return res.redirect(
+            '/line/login?next=%2Fsupport'
+          );
+
+        }
+
+
+        const db =
+          loadDB();
+
+
+        db.members =
+          db.members || {};
+
+
+        db.supportRequests =
+          db.supportRequests || {};
+
+
+        const member =
+          db.members[
+            lineUser.userId
+          ];
+
+
+        if (!member) {
+
+          deleteSlip();
+
+          return res.status(403).send(
+            '❌ ไม่พบข้อมูลสมาชิก'
+          );
+
+        }
+
+
+        const packageKey =
+          String(
+            req.body.supportPackage || ''
+          );
+
+
+        const selectedPackage =
+          SUPPORT_PACKAGES[
+            packageKey
+          ];
+
+
+        if (!selectedPackage) {
+
+          deleteSlip();
+
+          return res.status(400).send(
+            '❌ กรุณาเลือกแพ็กเกจสนับสนุน'
+          );
+
+        }
+
+
+        if (!req.file) {
+
+          return res.status(400).send(
+            '❌ กรุณาแนบสลิปสนับสนุน'
+          );
+
+        }
+
+
+        const requestId =
+          'SUP-' +
+          Date.now()
+            .toString(36)
+            .toUpperCase() +
+          '-' +
+          crypto
+            .randomBytes(3)
+            .toString('hex')
+            .toUpperCase();
+
+
+        // Token สำหรับเปิดดูสลิป
+        const slipViewToken =
+          crypto
+            .randomBytes(32)
+            .toString('hex');
+
+
+        const createdAt =
+          new Date().toISOString();
+
+
+        db.supportRequests[
+          requestId
+        ] = {
+
+          requestId,
+
+          userId:
+            lineUser.userId,
+
+          lineName:
+            lineUser.displayName ||
+            member.lineName ||
+            member.displayName ||
+            '',
+
+          memberPhone:
+            member.phone || '',
+
+
+          packageKey,
+
+          days:
+            selectedPackage.days,
+
+          amount:
+            selectedPackage.amount,
+
+
+          slipFile:
+            req.file.filename,
+
+          slipMimeType:
+            req.file.mimetype,
+
+          slipViewToken,
+
+
+          status:
+            'pending',
+
+          createdAt
+
+        };
+
+
+        saveDB(db);
+
+
+        const supportBaseUrl =
+          BASE_URL ||
+          'https://memegabot.com';
+
+
+        const slipUrl =
+          `${supportBaseUrl}/support/slip/${requestId}/${slipViewToken}`;
+
+
+        // =================================
+        // FLEX แจ้ง ADMIN
+        // =================================
+
+        const adminFlex = {
+
+          type: 'flex',
+
+          altText:
+            '💛 มีสลิปสนับสนุนสมาชิกใหม่',
+
+          contents: {
+
+            type: 'bubble',
+
+            size: 'mega',
+
+
+            header: {
+
+              type: 'box',
+
+              layout: 'vertical',
+
+              backgroundColor:
+                '#0F172A',
+
+              paddingAll:
+                '18px',
+
+              contents: [
+
+                {
+                  type: 'text',
+
+                  text:
+                    '💛 สลิปสนับสนุนสมาชิก',
+
+                  color:
+                    '#FFFFFF',
+
+                  weight:
+                    'bold',
+
+                  size:
+                    'lg',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `เลขคำขอ : ${requestId}`,
+
+                  color:
+                    '#94A3B8',
+
+                  size:
+                    'xs',
+
+                  margin:
+                    'sm'
+                }
+
+              ]
+            },
+
+
+            body: {
+
+              type: 'box',
+
+              layout: 'vertical',
+
+              spacing:
+                'md',
+
+              paddingAll:
+                '18px',
+
+              contents: [
+
+                {
+                  type: 'text',
+
+                  text:
+                    '👤 ข้อมูลสมาชิก',
+
+                  weight:
+                    'bold'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `LINE : ${
+                      lineUser.displayName ||
+                      member.lineName ||
+                      '-'
+                    }`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `UID : ${lineUser.userId}`,
+
+                  size:
+                    'xs',
+
+                  color:
+                    '#64748B',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `เบอร์สมาชิก : ${
+                      member.phone || '-'
+                    }`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'separator',
+
+                  margin:
+                    'md'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `📅 แพ็กเกจ : ${selectedPackage.label}`,
+
+                  weight:
+                    'bold',
+
+                  margin:
+                    'md',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `💰 ยอดสนับสนุน : ${selectedPackage.amount.toLocaleString('th-TH')} บาท`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    '🧾 สลิป : แนบแล้ว',
+
+                  size:
+                    'sm'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    '🟡 สถานะ : รอตรวจสอบ',
+
+                  color:
+                    '#D97706',
+
+                  weight:
+                    'bold',
+
+                  margin:
+                    'md'
+                }
+
+              ]
+            },
+
+
+            footer: {
+
+              type: 'box',
+
+              layout: 'vertical',
+
+              paddingAll:
+                '16px',
+
+              contents: [
+
+                {
+                  type: 'button',
+
+                  style:
+                    'primary',
+
+                  action: {
+
+                    type:
+                      'uri',
+
+                    label:
+                      '🧾 เปิดดูสลิป',
+
+                    uri:
+                      slipUrl
+
+                  }
+
+                }
+
+              ]
+
+            }
+
+          }
+
+        };
+
+
+        // ส่งทุก ADMIN
+        for (
+          const adminId
+          of ADMIN_IDS
+        ) {
+
+          try {
+
+            await push(
+              adminId,
+              adminFlex
+            );
+
+          } catch (err) {
+
+            console.error(
+              'SUPPORT ADMIN NOTIFY ERROR:',
+              err.response?.data ||
+              err.message
+            );
+
+          }
+
+        }
+
+
+        // =================================
+        // แจ้ง MEMBER
+        // =================================
+
+        try {
+
+          await push(
+            lineUser.userId,
+            {
+
+              type: 'text',
+
+              text:
+`✅ ส่งสลิปสนับสนุนเรียบร้อยแล้ว
+
+เลขคำขอ : ${requestId}
+━━━━━━━━━━━━━━━━━━
+📅 แพ็กเกจ : ${selectedPackage.label}
+💰 ยอดสนับสนุน : ${selectedPackage.amount.toLocaleString('th-TH')} บาท
+
+🟡 สถานะ : รอผู้ดูแลระบบตรวจสอบ
+
+เมื่อผู้ดูแลตรวจสอบเรียบร้อยแล้ว
+ระบบจะดำเนินการเพิ่มสิทธิ์ให้สมาชิก`
+
+            }
+          );
+
+        } catch (err) {
+
+          console.error(
+            'SUPPORT MEMBER NOTIFY ERROR:',
+            err.response?.data ||
+            err.message
+          );
+
+        }
+
+
+        // =================================
+        // SUCCESS PAGE
+        // =================================
+
+        return res.send(`
+<!DOCTYPE html>
+
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>ส่งสลิปสำเร็จ</title>
+
+</head>
+
+<body style="
+  margin:0;
+  min-height:100vh;
+  background:#070b11;
+  color:#fff;
+  font-family:Arial,Tahoma,sans-serif;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:20px;
+">
+
+<div style="
+  width:100%;
+  max-width:450px;
+  padding:30px;
+  background:#10161f;
+  border:1px solid #293747;
+  border-radius:20px;
+  text-align:center;
+">
+
+  <div style="
+    font-size:48px;
+  ">
+    ✅
+  </div>
+
+  <h2>
+    ส่งสลิปเรียบร้อยแล้ว
+  </h2>
+
+  <div style="
+    color:#94a3b8;
+    line-height:1.8;
+    font-size:13px;
+  ">
+
+    เลขคำขอ
+
+    <div style="
+      margin-top:7px;
+      color:#d7b56d;
+      font-size:19px;
+      font-weight:bold;
+    ">
+      ${requestId}
+    </div>
+
+    <br>
+
+    📅 ${selectedPackage.label}
+
+    <br>
+
+    💰 ${selectedPackage.amount.toLocaleString('th-TH')} บาท
+
+    <br><br>
+
+    🟡 รอผู้ดูแลระบบตรวจสอบ
+
+    <br><br>
+
+    ระบบได้ส่งข้อความยืนยัน
+    ไปยัง LINE ของท่านแล้ว
+
+  </div>
+
+</div>
+
+</body>
+
+</html>
+        `);
+
+
+      } catch (err) {
+
+        console.error(
+          'SUPPORT REQUEST ERROR:',
+          err
+        );
+
+
+        deleteSlip();
+
+
+        return res.status(500).send(
+          '❌ เกิดข้อผิดพลาดในการส่งสลิป'
+        );
+
+      }
+
+    }
+  );
+
+});
+
+// =====================================
+// VIEW SUPPORT SLIP
+// =====================================
+app.get(
+  '/support/slip/:requestId/:token',
+  (req, res) => {
+
+    const db =
+      loadDB();
+
+
+    const request =
+      db.supportRequests?.[
+        req.params.requestId
+      ];
+
+
+    if (
+      !request ||
+      request.slipViewToken !==
+        req.params.token
+    ) {
+
+      return res.status(404).send(
+        'ไม่พบสลิป'
+      );
+
+    }
+
+
+    const filePath =
+      path.join(
+        supportUploadDir,
+        request.slipFile
+      );
+
+
+    if (!fs.existsSync(filePath)) {
+
+      return res.status(404).send(
+        'ไม่พบไฟล์สลิป'
+      );
+
+    }
+
+
+    // ไม่ให้ browser cache
+    res.set(
+      'Cache-Control',
+      'no-store, private'
+    );
+
+
+    return res.sendFile(
+      filePath
+    );
+
+  }
+);
+
+app.get('/moneyflow', (req, res) => {
+
+  const lineUser =
+    req.session.lineUser;
+
+  if (!lineUser?.userId) {
+    return res.redirect(
+      '/line/login?next=%2Fmoneyflow'
+    );
+  }
+
+  const db = loadDB();
+
+  db.members =
+    db.members || {};
+
+  const member =
+    db.members[lineUser.userId];
+
+  if (!member) {
+    return res.status(403).send(
+      '❌ กรุณาลงทะเบียนสมาชิกก่อนใช้งาน'
+    );
+  }
+
+  const status =
+    String(member.status || '')
+      .trim()
+      .toLowerCase();
+
+  if (status !== 'approved') {
+    return res.status(403).send(
+      '🔒 บัญชีของท่านยังไม่ได้รับการอนุมัติ'
+    );
+  }
+
+  const expireDate =
+    member.expireAt
+      ? new Date(member.expireAt)
+      : null;
+
+  if (
+    expireDate &&
+    !Number.isNaN(expireDate.getTime()) &&
+    expireDate.getTime() <= Date.now()
+  ) {
+    return res.status(403).send(
+      '🔒 สิทธิ์สมาชิกของท่านหมดอายุแล้ว'
+    );
+  }
+
+  return res.sendFile(
+    path.join(
+      __dirname,
+      'private_pages',
+      'MoneyFlow_Offline.html'
+    )
+  );
+
+});
+
+// ==============================
+// LINE LOGIN - START
+// ==============================
+app.get('/line/login', (req, res) => {
+  try {
+
+    const nextPage =
+      String(req.query.next || '');
+
+    const allowedNextPages = [
+  '/member/status',
+  '/member/search',
+  '/member/search/history',
+  '/signal/request',
+  '/support',
+  '/moneyflow',
+  '/member/tools/image',
+  '/member/base/request'
+];
+
+    if (allowedNextPages.includes(nextPage)) {
+      req.session.lineLoginNext = nextPage;
+    } else {
+      delete req.session.lineLoginNext;
+    }
+
+
+    const state =
+      crypto
+        .randomBytes(24)
+        .toString('hex');
+
+    req.session.lineLoginState =
+      state;
+
+
+    const params =
+      new URLSearchParams({
+        response_type: 'code',
+        client_id:
+          LINE_LOGIN_CHANNEL_ID,
+        redirect_uri:
+          LINE_LOGIN_CALLBACK_URL,
+        state,
+        scope:
+          'profile openid'
+      });
+
+
+    // สำคัญ:
+    // บันทึก nextPage ลง Session
+    // ก่อนออกไป LINE
+    req.session.save((err) => {
+
+      if (err) {
+
+        console.error(
+          'LINE LOGIN SESSION SAVE ERROR:',
+          err
+        );
+
+        return res.status(500).send(
+          'ไม่สามารถเริ่มการเข้าสู่ระบบได้'
+        );
+      }
+
+
+      return res.redirect(
+        'https://access.line.me/oauth2/v2.1/authorize?' +
+        params.toString()
+      );
+
+    });
+
+
+  } catch (err) {
+
+    console.error(
+      'LINE LOGIN ERROR:',
+      err
+    );
+
+    return res.status(500).send(
+      'ไม่สามารถเข้าสู่ระบบ LINE ได้'
+    );
+
+  }
+});
+
+// ==============================
+// LINE LOGIN - CALLBACK
+// ==============================
+app.get('/line/callback', async (req, res) => {
+  try {
+    const { code, state, error, error_description } = req.query;
+
+    // กรณีผู้ใช้ยกเลิก หรือ LINE ส่ง error กลับมา
+    if (error) {
+      console.error('LINE LOGIN ERROR:', error, error_description);
+
+      return res.status(400).send(
+        `ไม่สามารถเข้าสู่ระบบ LINE ได้: ${error_description || error}`
+      );
+    }
+
+    // ตรวจสอบ state
+    if (
+      !state ||
+      !req.session.lineLoginState ||
+      state !== req.session.lineLoginState
+    ) {
+      return res.status(400).send(
+        'LINE Login ไม่ถูกต้อง กรุณาเริ่มเข้าสู่ระบบใหม่'
+      );
+    }
+
+    delete req.session.lineLoginState;
+
+    if (!code) {
+      return res.status(400).send(
+        'ไม่พบ Authorization Code จาก LINE'
+      );
+    }
+
+    // ==============================
+    // แลก Code เป็น Access Token
+    // ==============================
+    const tokenParams = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: LINE_LOGIN_CALLBACK_URL,
+      client_id: LINE_LOGIN_CHANNEL_ID,
+      client_secret: LINE_LOGIN_CHANNEL_SECRET
+    });
+
+    const tokenResponse = await axios.post(
+      'https://api.line.me/oauth2/v2.1/token',
+      tokenParams.toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+
+    const accessToken = tokenResponse.data.access_token;
+
+    if (!accessToken) {
+      return res.status(500).send(
+        'ไม่สามารถรับ Access Token จาก LINE ได้'
+      );
+    }
+
+    // ==============================
+    // ดึงข้อมูลบัญชี LINE
+    // ==============================
+    const profileResponse = await axios.get(
+      'https://api.line.me/v2/profile',
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`
+        }
+      }
+    );
+
+    const profile = profileResponse.data;
+
+    // ==============================
+    // เก็บใน Session
+    // ==============================
+    req.session.lineUser = {
+      userId: profile.userId,
+      displayName: profile.displayName || '',
+      pictureUrl: profile.pictureUrl || ''
+    };
+
+    const allowedNextPages = [
+  '/member/status',
+  '/member/search',
+  '/signal/request',
+  '/support',
+  '/moneyflow',
+  '/member/tools/image',
+  '/member/base/request'
+];
+
+const requestedNext =
+  req.session.lineLoginNext;
+
+const nextPage =
+  allowedNextPages.includes(requestedNext)
+    ? requestedNext
+    : '/register';
+
+delete req.session.lineLoginNext;
+
+
+req.session.save((err) => {
+
+  if (err) {
+
+    console.error(
+      'SESSION SAVE ERROR:',
+      err
+    );
+
+    return res.status(500).send(
+      'ไม่สามารถบันทึกข้อมูลการเข้าสู่ระบบได้'
+    );
+  }
+
+
+  return res.redirect(nextPage);
+
+});
+
+  } catch (err) {
+    console.error(
+      'LINE CALLBACK ERROR:',
+      err.response?.data || err.message
+    );
+
+    return res.status(500).send(
+      'เกิดข้อผิดพลาดในการเข้าสู่ระบบ LINE'
+    );
+  }
+});
+
+// ==============================
+// REGISTER PAGE
+// ==============================
+app.get('/register', (req, res) => {
+  const user = req.session.lineUser;
+
+  // ==============================
+  // ต้อง Login LINE ก่อน
+  // ==============================
+  if (!user?.userId) {
+    return res.redirect('/line/login');
+  }
+
+  // ==============================
+  // ป้องกัน HTML Injection
+  // ==============================
+  const escapeHtml = (value = '') =>
+    String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+  // ==============================
+  // ตรวจสอบข้อมูลสมาชิก
+  // ==============================
+  const registerDb = loadDB();
+
+  registerDb.members = registerDb.members || {};
+
+  const member =
+    registerDb.members[user.userId];
+
+  const memberStatus =
+    String(member?.status || '')
+      .trim()
+      .toLowerCase();
+
+  // ==============================
+  // ฟังก์ชันแสดงหน้าสถานะ
+  // ==============================
+  const showRegisterStatus = ({
+    icon,
+    title,
+    message,
+    statusText,
+    statusColor,
+    borderColor
+  }) => {
+    const name = escapeHtml(
+      member?.fullname ||
+      member?.fullName ||
+      member?.lineName ||
+      user.displayName ||
+      '-'
+    );
+
+    const uid = escapeHtml(user.userId);
+
+    return res.send(`
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>${escapeHtml(title)}</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+
+  background: #070b11;
+  color: #ffffff;
+
+  font-family: Arial, Tahoma, sans-serif;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 20px;
+}
+
+.card {
+  width: 100%;
+  max-width: 500px;
+
+  background: #10161f;
+
+  border: 1px solid #2b3542;
+  border-radius: 20px;
+
+  padding: 36px 26px;
+
+  text-align: center;
+}
+
+.icon {
+  font-size: 52px;
+  margin-bottom: 15px;
+}
+
+.title {
+  font-size: 21px;
+  font-weight: bold;
+  margin-bottom: 10px;
+}
+
+.name {
+  margin-top: 18px;
+
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: bold;
+}
+
+.message {
+  margin-top: 12px;
+
+  color: #94a3b8;
+
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.status {
+  display: inline-block;
+
+  margin-top: 22px;
+  padding: 9px 17px;
+
+  border: 1px solid ${borderColor};
+  border-radius: 30px;
+
+  color: ${statusColor};
+
+  font-size: 13px;
+  font-weight: bold;
+}
+
+.uid {
+  margin-top: 18px;
+
+  color: #64748b;
+
+  font-size: 10px;
+  word-break: break-all;
+}
+</style>
+
+</head>
+
+<body>
+
+<div class="card">
+
+  <div class="icon">
+    ${icon}
+  </div>
+
+  <div class="title">
+    ${escapeHtml(title)}
+  </div>
+
+  <div class="name">
+    ${name}
+  </div>
+
+  <div class="message">
+    ${message}
+  </div>
+
+  <div
+    class="status"
+  >
+    ${escapeHtml(statusText)}
+  </div>
+
+  <div class="uid">
+    UID : ${uid}
+  </div>
+
+</div>
+
+</body>
+</html>
+    `);
+  };
+
+  // ==============================
+  // สมัครแล้ว รอแอดมินอนุมัติ
+  // ==============================
+  if (member && memberStatus === 'pending') {
+    return showRegisterStatus({
+      icon: '🟡',
+
+      title:
+        'ท่านลงทะเบียนเรียบร้อยแล้ว',
+
+      message:
+        'ระบบได้รับข้อมูลการสมัครของท่านแล้ว<br>' +
+        'กรุณารอผู้ดูแลระบบตรวจสอบและอนุมัติ<br>' +
+        'ไม่จำเป็นต้องลงทะเบียนซ้ำ',
+
+      statusText:
+        'สถานะ : รอการอนุมัติ',
+
+      statusColor:
+        '#E6C66F',
+
+      borderColor:
+        '#8A713C'
+    });
+  }
+
+  // ==============================
+  // สมาชิกที่ได้รับอนุมัติแล้ว
+  // ==============================
+  if (member && memberStatus === 'approved') {
+    return showRegisterStatus({
+      icon: '✅',
+
+      title:
+        'ท่านเป็นสมาชิกเรียบร้อยแล้ว',
+
+      message:
+        'บัญชี LINE นี้ได้รับการอนุมัติเป็นสมาชิกแล้ว<br>' +
+        'สามารถใช้งานระบบตามสิทธิ์ที่ได้รับ<br>' +
+        'ไม่จำเป็นต้องลงทะเบียนซ้ำ',
+
+      statusText:
+        'สถานะ : สมาชิก',
+
+      statusColor:
+        '#86EFAC',
+
+      borderColor:
+        '#3C7651'
+    });
+  }
+
+  // ==============================
+  // รองรับสมาชิกเก่าที่มีข้อมูลอยู่แล้ว
+  // แต่ไม่มี status
+  // ==============================
+  if (member && !memberStatus) {
+    return showRegisterStatus({
+      icon: '🔵',
+
+      title:
+        'ท่านลงทะเบียนไว้แล้ว',
+
+      message:
+        'ระบบพบข้อมูลการลงทะเบียนของบัญชี LINE นี้แล้ว<br>' +
+        'ไม่จำเป็นต้องกรอกข้อมูลสมัครสมาชิกซ้ำ',
+
+      statusText:
+        'สถานะ : ลงทะเบียนแล้ว',
+
+      statusColor:
+        '#93C5FD',
+
+      borderColor:
+        '#3B82F6'
+    });
+  }
+
+  // ==============================
+  // ไม่มีข้อมูลสมาชิก
+  // จึงให้แสดงแบบฟอร์มสมัครเดิม
+  // ==============================
+  const displayName =
+    escapeHtml(user.displayName || '-');
+
+  const userId =
+    escapeHtml(user.userId || '-');
+
+  const pictureUrl =
+    user.pictureUrl
+      ? escapeHtml(user.pictureUrl)
+      : '';
+
+  return res.send(`
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>สมัครสมาชิก</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #070b11;
+  color: #e5e7eb;
+  font-family: Arial, Tahoma, sans-serif;
+}
+
+.page {
+  padding: 14px;
+}
+
+.container {
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px;
+  background: #10161f;
+  border: 1px solid #2b3542;
+  border-radius: 22px;
+}
+
+.section-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #ffffff;
+  margin-bottom: 14px;
+}
+
+.account-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.identity-badge {
+  border: 1px solid #405064;
+  border-radius: 30px;
+  padding: 6px 10px;
+  font-size: 10px;
+  color: #9fb3ca;
+}
+
+.line-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  border: 1px solid #2c3948;
+  background: #080d13;
+  padding: 20px;
+  border-radius: 16px;
+}
+
+.avatar {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid #3b495a;
+  background: #1e293b;
+}
+
+.avatar-default {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: #202938;
+  border: 1px solid #3b495a;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 30px;
+}
+
+.account-label {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.account-name {
+  font-size: 18px;
+  color: #ffffff;
+  font-weight: bold;
+  margin-top: 4px;
+}
+
+.account-uid {
+  font-size: 11px;
+  color: #cbd5e1;
+  margin-top: 5px;
+  word-break: break-all;
+}
+
+.verified {
+  color: #b8e7c3;
+  font-size: 11px;
+  margin-top: 7px;
+}
+
+.divider {
+  border: 0;
+  border-top: 1px solid #293441;
+  margin: 26px 0;
+}
+
+.description {
+  color: #8fa1b5;
+  font-size: 12px;
+  margin-top: -5px;
+  margin-bottom: 20px;
+}
+
+.row {
+  display: flex;
+  gap: 14px;
+}
+
+.field {
+  width: 100%;
+  margin-bottom: 17px;
+}
+
+label {
+  display: block;
+  margin-bottom: 7px;
+  color: #d8e4f0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.required {
+  color: #d8b66c;
+}
+
+input[type="text"],
+input[type="tel"] {
+  width: 100%;
+  height: 48px;
+  padding: 0 14px;
+  border: 1px solid #354355;
+  border-radius: 11px;
+  outline: none;
+  background: #080e15;
+  color: #ffffff;
+  font-size: 14px;
+}
+
+input::placeholder {
+  color: #64748b;
+}
+
+input:focus {
+  border-color: #d5b46c;
+}
+
+.upload-box {
+  min-height: 140px;
+  border: 1px dashed #53667d;
+  border-radius: 14px;
+  background: #080d13;
+  cursor: pointer;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  text-align: center;
+  padding: 20px;
+}
+
+.upload-box input {
+  display: none;
+}
+
+.upload-icon {
+  font-size: 28px;
+  color: #d5e5f5;
+}
+
+.upload-title {
+  margin-top: 10px;
+  color: #dbeafe;
+  font-weight: bold;
+  font-size: 14px;
+}
+
+.upload-sub {
+  color: #8297ad;
+  font-size: 11px;
+  margin-top: 5px;
+}
+
+#fileName {
+  color: #d8b66c;
+  margin-top: 8px;
+  font-size: 11px;
+}
+
+.consent {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  margin: 18px 0 24px;
+  color: #a7b6c7;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.consent input {
+  margin-top: 4px;
+}
+
+.submit-btn {
+  width: 100%;
+  height: 52px;
+  border: 0;
+  border-radius: 11px;
+  background: #d7b56d;
+  color: #151515;
+  font-size: 14px;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.submit-btn:hover {
+  opacity: .94;
+}
+
+@media (max-width: 600px) {
+  .page {
+    padding: 8px;
+  }
+
+  .container {
+    padding: 20px;
+    border-radius: 18px;
+  }
+
+  .row {
+    display: block;
+  }
+
+  .line-card {
+    padding: 16px;
+  }
+
+  .avatar,
+  .avatar-default {
+    width: 58px;
+    height: 58px;
+  }
+}
+</style>
+
+</head>
+
+<body>
+
+<div class="page">
+
+<div class="container">
+
+  <div class="account-header">
+    <div class="section-title">
+      ข้อมูลบัญชี LINE
+    </div>
+
+    <div class="identity-badge">
+      IDENTITY
+    </div>
+  </div>
+
+
+  <div class="line-card">
+
+    ${
+      pictureUrl
+        ? `
+          <img
+            src="${pictureUrl}"
+            class="avatar"
+            alt="LINE Profile"
+          >
+        `
+        : `
+          <div class="avatar-default">
+            👤
+          </div>
+        `
+    }
+
+    <div>
+
+      <div class="account-label">
+        บัญชีที่เข้าสู่ระบบ
+      </div>
+
+      <div class="account-name">
+        ${displayName}
+      </div>
+
+      <div class="account-uid">
+        UID : ${userId}
+      </div>
+
+      <div class="verified">
+        ● ยืนยันตัวตนผ่าน LINE Login
+      </div>
+
+    </div>
+
+  </div>
+
+
+  <hr class="divider">
+
+
+  <div class="section-title">
+    ข้อมูลผู้สมัคร
+  </div>
+
+  <div class="description">
+    กรุณากรอกข้อมูลให้ครบถ้วนและตรงตามเอกสารราชการ
+  </div>
+
+
+  <form
+    action="/register"
+    method="POST"
+    enctype="multipart/form-data"
+  >
+
+    <div class="row">
+
+      <div class="field">
+
+        <label>
+          ยศ
+          <span class="required">*</span>
+        </label>
+
+        <input
+          type="text"
+          name="rank"
+          placeholder="ระบุยศ"
+          maxlength="100"
+          required
+        >
+
+      </div>
+
+
+      <div class="field">
+
+        <label>
+          ชื่อ - นามสกุล
+          <span class="required">*</span>
+        </label>
+
+        <input
+          type="text"
+          name="fullName"
+          placeholder="ระบุชื่อ - นามสกุล"
+          maxlength="200"
+          required
+        >
+
+      </div>
+
+    </div>
+
+
+    <div class="row">
+
+      <div class="field">
+
+        <label>
+          ตำแหน่ง
+          <span class="required">*</span>
+        </label>
+
+        <input
+          type="text"
+          name="position"
+          placeholder="ระบุตำแหน่ง"
+          maxlength="150"
+          required
+        >
+
+      </div>
+
+
+      <div class="field">
+
+        <label>
+          สังกัด
+          <span class="required">*</span>
+        </label>
+
+        <input
+          type="text"
+          name="organization"
+          placeholder="ระบุหน่วยงาน / สังกัด"
+          maxlength="200"
+          required
+        >
+
+      </div>
+
+    </div>
+
+
+    <div class="field">
+
+      <label>
+        หมายเลขโทรศัพท์
+        <span class="required">*</span>
+      </label>
+
+      <input
+        type="tel"
+        name="phone"
+        placeholder="เช่น 0812345678"
+        inputmode="numeric"
+        pattern="[0-9]{9,10}"
+        maxlength="10"
+        required
+      >
+
+    </div>
+
+
+    <hr class="divider">
+
+
+    <div class="section-title">
+      เอกสารประกอบการสมัคร
+    </div>
+
+    <div class="description">
+      แนบภาพบัตรข้าราชการหรือเอกสารยืนยันตัวตนที่ชัดเจน
+    </div>
+
+
+    <label class="upload-box">
+
+      <input
+        id="idCard"
+        type="file"
+        name="idCard"
+        accept="image/jpeg,image/png"
+        required
+      >
+
+      <div>
+
+        <div class="upload-icon">
+          ▣
+        </div>
+
+        <div class="upload-title">
+          แนบบัตรข้าราชการ
+        </div>
+
+        <div class="upload-sub">
+          แตะเพื่อเลือกรูปภาพ • JPG / PNG
+        </div>
+
+        <div id="fileName"></div>
+
+      </div>
+
+    </label>
+
+
+    <div class="consent">
+
+      <input
+        type="checkbox"
+        name="consent"
+        value="yes"
+        required
+      >
+
+      <div>
+        ข้าพเจ้ารับรองว่าข้อมูลที่ระบุเป็นข้อมูลที่ถูกต้อง
+        และยินยอมให้ข้อมูลเพื่อการตรวจสอบและพิจารณาสิทธิ์สมัครสมาชิก
+      </div>
+
+    </div>
+
+
+    <button
+      class="submit-btn"
+      type="submit"
+    >
+      ยืนยันและส่งคำขอสมัครสมาชิก
+    </button>
+
+  </form>
+
+</div>
+</div>
+
+
+<script>
+const fileInput = document.getElementById('idCard');
+const fileName = document.getElementById('fileName');
+
+fileInput.addEventListener('change', function () {
+
+  if (this.files && this.files.length > 0) {
+
+    fileName.textContent =
+      'ไฟล์ที่เลือก : ' + this.files[0].name;
+
+  } else {
+
+    fileName.textContent = '';
+
+  }
+
+});
+</script>
+
+</body>
+</html>
+  `);
+});
+
+// ==============================
+// REGISTER - SUBMIT
+// ==============================
+app.post('/register', (req, res) => {
+
+  registrationUpload.single('idCard')(req, res, async (uploadErr) => {
+    try {
+
+      if (uploadErr) {
+        console.error('REGISTER UPLOAD ERROR:', uploadErr);
+
+        return res.status(400).send(
+          `❌ อัปโหลดเอกสารไม่สำเร็จ: ${uploadErr.message}`
+        );
+      }
+
+      // ต้องผ่าน LINE Login มาก่อน
+      const lineUser = req.session.lineUser;
+
+      if (!lineUser || !lineUser.userId) {
+        if (req.file?.path) {
+          fs.unlink(req.file.path, () => {});
+        }
+
+        return res.redirect('/line/login');
+      }
+
+      // รับข้อมูลจาก Form
+      const rank = String(req.body.rank || '').trim();
+      const fullName = String(req.body.fullName || '').trim();
+      const position = String(req.body.position || '').trim();
+      const organization = String(req.body.organization || '').trim();
+
+      const phone = String(req.body.phone || '')
+        .replace(/\D/g, '')
+        .trim();
+
+      const consent = req.body.consent === 'yes';
+
+      // ตรวจข้อมูล
+      if (
+        !rank ||
+        !fullName ||
+        !position ||
+        !organization ||
+        !phone
+      ) {
+        if (req.file?.path) {
+          fs.unlink(req.file.path, () => {});
+        }
+
+        return res.status(400).send(
+          '❌ กรุณากรอกข้อมูลให้ครบถ้วน'
+        );
+      }
+
+      if (!/^0\d{8,9}$/.test(phone)) {
+        if (req.file?.path) {
+          fs.unlink(req.file.path, () => {});
+        }
+
+        return res.status(400).send(
+          '❌ หมายเลขโทรศัพท์ไม่ถูกต้อง'
+        );
+      }
+
+      if (!consent) {
+        if (req.file?.path) {
+          fs.unlink(req.file.path, () => {});
+        }
+
+        return res.status(400).send(
+          '❌ กรุณายืนยันการรับรองข้อมูล'
+        );
+      }
+
+      if (!req.file) {
+        return res.status(400).send(
+          '❌ กรุณาแนบเอกสารประกอบการสมัคร'
+        );
+      }
+
+      const applicationData = {
+  userId: lineUser.userId,
+
+  // ข้อมูลจาก LINE
+  lineName: lineUser.displayName || '',
+  displayName: lineUser.displayName || '',
+  pictureUrl: lineUser.pictureUrl || '',
+
+  // ข้อมูลผู้สมัคร
+  rank,
+
+  // เก็บทั้ง 2 ชื่อ เพื่อรองรับโค้ดเดิม
+  fullname: fullName,
+  fullName,
+
+  position,
+  organization,
+  phone,
+
+  // เอกสาร
+  documentFile: req.file.filename,
+
+  // สถานะสมาชิก
+  status: 'pending',
+  registeredAt: new Date().toISOString()
+};
+
+
+// ==============================
+// บันทึกเข้า DB สมาชิกเดิม
+// ==============================
+const registerDb = loadDB();
+
+registerDb.members = registerDb.members || {};
+
+const oldMember =
+  registerDb.members[lineUser.userId];
+
+
+// ถ้าเป็นสมาชิกที่อนุมัติแล้ว ไม่ให้สมัครซ้ำ
+if (oldMember?.status === 'approved') {
+
+  if (req.file?.path) {
+    fs.unlink(req.file.path, () => {});
+  }
+
+  return res.status(400).send(`
+    <!DOCTYPE html>
+    <html lang="th">
+    <head>
+      <meta charset="UTF-8">
+      <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+      >
+      <title>เป็นสมาชิกแล้ว</title>
+    </head>
+
+    <body style="
+      margin:0;
+      min-height:100vh;
+      background:#070b11;
+      color:#fff;
+      font-family:Arial,Tahoma,sans-serif;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      text-align:center;
+      padding:20px;
+    ">
+
+      <div>
+        <h2>✅ บัญชีนี้เป็นสมาชิกอยู่แล้ว</h2>
+
+        <p style="color:#94a3b8;">
+          ไม่จำเป็นต้องส่งคำขอสมัครสมาชิกใหม่
+        </p>
+      </div>
+
+    </body>
+    </html>
+  `);
+}
+
+// เก็บ field เดิมไว้ แล้วอัปเดตข้อมูลสมัครใหม่
+registerDb.members[lineUser.userId] = {
+  ...(oldMember || {}),
+  ...applicationData
+};
+
+
+// บันทึกฐานข้อมูล
+saveDB(registerDb);
+
+// ==============================
+// แจ้งแอดมินว่ามีสมาชิกสมัครใหม่
+// ==============================
+await notifyAdmins({
+  type: 'flex',
+  altText: '📥 มีคำขอสมัครสมาชิกใหม่',
+
+  contents: {
+    type: 'bubble',
+    size: 'mega',
+
+    // ==============================
+    // HEADER
+    // ==============================
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      backgroundColor: '#0F172A',
+      paddingAll: '16px',
+
+      contents: [
+        {
+          type: 'text',
+          text: '📥 คำขอสมัครสมาชิกใหม่',
+          color: '#FFFFFF',
+          weight: 'bold',
+          size: 'lg'
+        },
+        {
+          type: 'text',
+          text: 'รอการตรวจสอบและอนุมัติ',
+          color: '#CBD5E1',
+          size: 'sm',
+          margin: 'sm'
+        }
+      ]
+    },
+
+
+    // ==============================
+    // BODY
+    // ==============================
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'md',
+
+      contents: [
+        {
+          type: 'text',
+          text: `👤 LINE : ${lineUser.displayName || '-'}`,
+          wrap: true
+        },
+        {
+          type: 'text',
+          text: `🆔 UID : ${lineUser.userId}`,
+          size: 'sm',
+          wrap: true
+        },
+
+        {
+          type: 'separator',
+          margin: 'md'
+        },
+
+        {
+          type: 'text',
+          text: `🎖️ ยศ : ${rank}`,
+          wrap: true
+        },
+        {
+          type: 'text',
+          text: `👨‍💼 ชื่อ-นามสกุล : ${fullName}`,
+          wrap: true
+        },
+        {
+          type: 'text',
+          text: `💼 ตำแหน่ง : ${position}`,
+          wrap: true
+        },
+        {
+          type: 'text',
+          text: `🏢 สังกัด : ${organization}`,
+          wrap: true
+        },
+        {
+          type: 'text',
+          text: `📱 โทรศัพท์ : ${phone}`,
+          wrap: true
+        },
+
+        {
+          type: 'separator',
+          margin: 'md'
+        },
+
+        {
+          type: 'text',
+          text: '🟡 สถานะ : รอการอนุมัติ',
+          color: '#B7791F',
+          weight: 'bold',
+          margin: 'md'
+        }
+      ]
+    },
+
+
+    // ==============================
+    // FOOTER - ปุ่มอนุมัติ
+    // ==============================
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      paddingAll: '16px',
+
+      contents: [
+
+        // 30 / 90 วัน
+        {
+          type: 'box',
+          layout: 'horizontal',
+          spacing: 'sm',
+
+          contents: [
+            {
+              type: 'button',
+              style: 'primary',
+              height: 'sm',
+
+              action: {
+                type: 'postback',
+                label: '✅ 30 วัน',
+                data: `approve_days|${lineUser.userId}|30`,
+                displayText: `อนุมัติ ${fullName} 30 วัน`
+              }
+            },
+
+            {
+              type: 'button',
+              style: 'primary',
+              height: 'sm',
+
+              action: {
+                type: 'postback',
+                label: '✅ 90 วัน',
+                data: `approve_days|${lineUser.userId}|90`,
+                displayText: `อนุมัติ ${fullName} 90 วัน`
+              }
+            }
+          ]
+        },
+
+
+        // 180 / 365 วัน
+        {
+          type: 'box',
+          layout: 'horizontal',
+          spacing: 'sm',
+
+          contents: [
+            {
+              type: 'button',
+              style: 'secondary',
+              height: 'sm',
+
+              action: {
+                type: 'postback',
+                label: '180 วัน',
+                data: `approve_days|${lineUser.userId}|180`,
+                displayText: `อนุมัติ ${fullName} 180 วัน`
+              }
+            },
+
+            {
+              type: 'button',
+              style: 'secondary',
+              height: 'sm',
+
+              action: {
+                type: 'postback',
+                label: '365 วัน',
+                data: `approve_days|${lineUser.userId}|365`,
+                displayText: `อนุมัติ ${fullName} 365 วัน`
+              }
+            }
+          ]
+        }
+
+      ]
+    }
+
+  }
+});
+
+console.log(
+  'REGISTER DATA:',
+  applicationData
+);
+
+      return res.send(`
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>ส่งคำขอสำเร็จ</title>
+
+<style>
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #070b11;
+  color: #ffffff;
+  font-family: Arial, Tahoma, sans-serif;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.card {
+  width: 100%;
+  max-width: 460px;
+  background: #10161f;
+  border: 1px solid #2b3542;
+  border-radius: 20px;
+  padding: 35px 25px;
+  text-align: center;
+}
+
+.icon {
+  font-size: 48px;
+}
+
+h2 {
+  margin: 15px 0 10px;
+}
+
+p {
+  color: #94a3b8;
+  line-height: 1.7;
+}
+
+.status {
+  display: inline-block;
+  margin-top: 15px;
+  padding: 8px 16px;
+  border: 1px solid #806a3d;
+  border-radius: 30px;
+  color: #e3c271;
+}
+</style>
+</head>
+
+<body>
+
+<div class="card">
+
+  <div class="icon">✅</div>
+
+  <h2>
+    ส่งคำขอสมัครสมาชิกสำเร็จ
+  </h2>
+
+  <p>
+    ระบบได้รับข้อมูลของคุณแล้ว<br>
+    กรุณารอผู้ดูแลระบบตรวจสอบและอนุมัติ
+  </p>
+
+  <div class="status">
+    สถานะ : รอตรวจสอบ
+  </div>
+
+</div>
+
+</body>
+</html>
+      `);
+
+    } catch (err) {
+
+      console.error('REGISTER ERROR:', err);
+
+      if (req.file?.path) {
+        fs.unlink(req.file.path, () => {});
+      }
+
+      return res.status(500).send(
+        '❌ เกิดข้อผิดพลาดในการสมัครสมาชิก'
+      );
+    }
+  });
+});
+
+// =====================================
+// MEMBER SEARCH PAGE
+// ต้อง Login LINE ก่อน
+// =====================================
+app.get(
+  '/member/search',
+  (req, res) => {
+
+    const lineUser =
+      req.session.lineUser;
+
+
+    // ยังไม่ได้ Login LINE
+    if (!lineUser?.userId) {
+
+      return res.redirect(
+        '/line/login?next=%2Fmember%2Fsearch'
+      );
+    }
+
+
+    // Login แล้ว เปิดหน้าค้นหา
+    return res.sendFile(
+      path.join(
+        __dirname,
+        'private_pages',
+        'member-search.html'
+      )
+    );
+
+  }
+);
+
+// =====================================
+// MEMBER SEARCH : PROFILE API
+// =====================================
+app.get('/member/search/me', (req, res) => {
+
+  const lineUser =
+    req.session.lineUser;
+
+  // ยังไม่ได้ Login LINE
+  if (!lineUser?.userId) {
+    return res.status(401).json({
+      ok: false,
+      loginUrl:
+        '/line/login?next=%2Fmember%2Fsearch'
+    });
+  }
+
+
+  const db =
+    loadDB();
+
+  db.members =
+    db.members || {};
+
+
+  const member =
+    db.members[
+      lineUser.userId
+    ];
+
+
+  // ไม่พบสมาชิก
+  if (!member) {
+    return res.status(403).json({
+      ok: false,
+      message:
+        'ไม่พบข้อมูลสมาชิก'
+    });
+  }
+
+
+  const phone =
+    String(
+      member.phone ||
+      member.tel ||
+      member.mobile ||
+      ''
+    )
+      .replace(/\D/g, '');
+
+
+  // =============================
+  // วันหมดอายุ
+  // =============================
+
+  const expireAt =
+    member.expireAt || '';
+
+
+  let remainingDays =
+    null;
+
+
+  if (expireAt) {
+
+    const expireDate =
+      new Date(expireAt);
+
+    if (
+      !Number.isNaN(
+        expireDate.getTime()
+      )
+    ) {
+
+      const diff =
+        expireDate.getTime() -
+        Date.now();
+
+      remainingDays =
+        Math.max(
+          0,
+          Math.ceil(
+            diff /
+            (1000 * 60 * 60 * 24)
+          )
+        );
+    }
+  }
+
+
+  // =============================
+  // สิทธิ์ SI
+  // =============================
+
+  const siAllowed =
+    db.siBlocked?.[phone] !== true;
+
+
+  return res.json({
+
+    ok: true,
+
+    member: {
+
+      userId:
+        lineUser.userId,
+
+      displayName:
+        lineUser.displayName ||
+        member.lineName ||
+        '-',
+
+      pictureUrl:
+        lineUser.pictureUrl ||
+        member.pictureUrl ||
+        '',
+
+      fullname:
+        member.fullname ||
+        member.fullName ||
+        '-',
+
+      phone:
+        phone || '-',
+
+      status:
+        member.status ||
+        '-',
+
+      expireAt,
+
+      remainingDays,
+
+      permissions: {
+        si: siAllowed,
+        atm: true,
+        store: true,
+        welfare: true
+      }
+
+    }
+
+  });
+});
+
+// ==========================================
+// MEMBER TOOL : PLATE OCR
+// รับรูปจาก LIFF / WEB
+// ==========================================
+
+app.post(
+  '/member/tools/plate-ocr',
+  (req, res) => {
+
+    toolUpload.single('image')(
+      req,
+      res,
+      async uploadErr => {
+
+        // =========================
+        // ลบไฟล์ชั่วคราว
+        // =========================
+        const deleteTempImage = () => {
+
+          if (
+            req.file?.path &&
+            fs.existsSync(req.file.path)
+          ) {
+
+            try {
+              fs.unlinkSync(req.file.path);
+            } catch (err) {
+              console.error(
+                'DELETE PLATE TEMP ERROR:',
+                err.message
+              );
+            }
+
+          }
+
+        };
+
+
+        try {
+
+          // =========================
+          // Upload Error
+          // =========================
+          if (uploadErr) {
+
+            return res.status(400).json({
+              ok: false,
+              message:
+                uploadErr.message ||
+                'อัปโหลดรูปไม่สำเร็จ'
+            });
+
+          }
+
+
+          // =========================
+          // ตรวจ LINE Login
+          // =========================
+          const lineUser =
+            req.session?.lineUser;
+
+
+          if (!lineUser?.userId) {
+
+            deleteTempImage();
+
+            return res.status(401).json({
+              ok: false,
+              message:
+                'กรุณาเข้าสู่ระบบ LINE ก่อน',
+              loginUrl:
+                '/line/login?next=%2Fmember%2Ftools%2Fimage'
+            });
+
+          }
+
+
+          // =========================
+          // ตรวจสมาชิก
+          // =========================
+          const db =
+            loadDB();
+
+          db.members =
+            db.members || {};
+
+          const member =
+            db.members[lineUser.userId];
+
+
+          if (!member) {
+
+            deleteTempImage();
+
+            return res.status(403).json({
+              ok: false,
+              message:
+                'ไม่พบข้อมูลสมาชิก'
+            });
+
+          }
+
+
+          if (!isActiveMember(member)) {
+
+            deleteTempImage();
+
+            return res.status(403).json({
+              ok: false,
+              message:
+                'สมาชิกยังไม่ได้รับอนุมัติ หรือหมดอายุแล้ว'
+            });
+
+          }
+
+
+          // =========================
+          // ตรวจไฟล์
+          // =========================
+          if (!req.file) {
+
+            return res.status(400).json({
+              ok: false,
+              message:
+                'กรุณาเลือกรูปป้ายทะเบียน'
+            });
+
+          }
+
+
+          const imagePath =
+            req.file.path;
+
+
+          // =========================
+          // อ่านป้ายทะเบียน
+          // ใช้ฟังก์ชันเดิมของ BOT
+          // =========================
+          const result =
+  await readPlateOcr(
+    imagePath,
+    req.file.originalname,
+    req.file.mimetype
+  );
+
+
+          const resultText =
+            formatPlateOcr(
+              result
+            );
+
+
+          // ลบรูปหลังอ่านเสร็จ
+          deleteTempImage();
+
+
+          return res.json({
+            ok: true,
+            result: resultText
+          });
+
+
+        } catch (err) {
+
+          deleteTempImage();
+
+          console.error(
+            'WEB PLATE OCR ERROR:',
+            err?.response?.data ||
+            err.message ||
+            err
+          );
+
+
+          return res.status(500).json({
+            ok: false,
+            message:
+              'อ่านป้ายทะเบียนไม่สำเร็จ กรุณาลองใหม่อีกครั้ง'
+          });
+
+        }
+
+      }
+    );
+
+  }
+);
+
+// ==========================================
+// MEMBER BASE REQUEST : SUBMIT
+// รับข้อมูลจาก LIFF
+// ==========================================
+
+app.post(
+  '/member/base/request/submit',
+  (req, res) => {
+
+    toolUpload.single('evidence')(
+      req,
+      res,
+      async uploadErr => {
+
+        let savedFilePath =
+          req.file?.path || '';
+
+
+        const deleteUploadedFile = () => {
+
+          if (
+            savedFilePath &&
+            fs.existsSync(savedFilePath)
+          ) {
+
+            try {
+              fs.unlinkSync(
+                savedFilePath
+              );
+            } catch (err) {
+
+              console.error(
+                'DELETE BASE FILE ERROR:',
+                err.message
+              );
+
+            }
+
+          }
+
+        };
+
+
+        try {
+
+          // =========================
+          // UPLOAD ERROR
+          // =========================
+
+          if (uploadErr) {
+
+            deleteUploadedFile();
+
+            return res.status(400).json({
+              ok: false,
+              message:
+                uploadErr.message ||
+                'อัปโหลดหลักฐานไม่สำเร็จ'
+            });
+
+          }
+
+
+          // =========================
+          // LINE LOGIN
+          // =========================
+
+          const lineUser =
+            req.session?.lineUser;
+
+
+          if (!lineUser?.userId) {
+
+            deleteUploadedFile();
+
+            return res.status(401).json({
+              ok: false,
+
+              message:
+                'กรุณาเข้าสู่ระบบ LINE ก่อน',
+
+              loginUrl:
+                '/line/login?next=%2Fmember%2Fbase%2Frequest'
+            });
+
+          }
+
+
+          // =========================
+          // MEMBER
+          // =========================
+
+          const db =
+            loadDB();
+
+          db.members =
+            db.members || {};
+
+
+          const member =
+            db.members[
+              lineUser.userId
+            ];
+
+
+          if (
+            !member ||
+            (
+              !isActiveMember(member) &&
+              !isAdmin(lineUser.userId)
+            )
+          ) {
+
+            deleteUploadedFile();
+
+            return res.status(403).json({
+              ok: false,
+
+              message:
+                'บัญชีสมาชิกนี้ไม่มีสิทธิ์ส่งคำขอ BASE'
+            });
+
+          }
+
+
+          // =========================
+          // รับค่าจาก FORM
+          // =========================
+
+          const phone =
+            String(
+              req.body?.phone || ''
+            )
+              .replace(/\D/g, '');
+
+
+          const network =
+            String(
+              req.body?.network || ''
+            )
+              .trim()
+              .toUpperCase();
+
+
+          const caseName =
+            String(
+              req.body?.caseName || ''
+            )
+              .trim();
+
+
+          const targetName =
+            String(
+              req.body?.targetName || ''
+            )
+              .trim();
+
+
+          const citizenId =
+            String(
+              req.body?.citizenId || ''
+            )
+              .replace(/\D/g, '');
+
+
+          // =========================
+          // ตรวจหมายเลขโทรศัพท์
+          // =========================
+
+          if (
+            !/^0\d{9}$/.test(phone)
+          ) {
+
+            deleteUploadedFile();
+
+            return res.status(400).json({
+              ok: false,
+
+              message:
+                'กรุณาระบุหมายเลขเป้าหมายให้ครบ 10 หลัก'
+            });
+
+          }
+
+
+          // =========================
+          // ตรวจเครือข่าย
+          // =========================
+
+          if (
+            ![
+              'AIS',
+              'TRUE',
+              'DTAC'
+            ].includes(network)
+          ) {
+
+            deleteUploadedFile();
+
+            return res.status(400).json({
+              ok: false,
+
+              message:
+                'กรุณาเลือกเครือข่าย AIS, TRUE หรือ DTAC'
+            });
+
+          }
+
+
+          // =========================
+          // ตรวจชื่อเคส
+          // =========================
+
+          if (
+            caseName.length < 2 ||
+            caseName.length > 500
+          ) {
+
+            deleteUploadedFile();
+
+            return res.status(400).json({
+              ok: false,
+
+              message:
+                'กรุณาระบุชื่อเคสหรือเหตุในการขอข้อมูล'
+            });
+
+          }
+
+
+          // =========================
+          // ตรวจชื่อเป้าหมาย
+          // =========================
+
+          if (
+            targetName.length < 2 ||
+            targetName.length > 200
+          ) {
+
+            deleteUploadedFile();
+
+            return res.status(400).json({
+              ok: false,
+
+              message:
+                'กรุณาระบุชื่อ-นามสกุลเป้าหมาย'
+            });
+
+          }
+
+
+          // =========================
+          // ตรวจเลขบัตร
+          // =========================
+
+          if (
+            !/^\d{13}$/.test(
+              citizenId
+            )
+          ) {
+
+            deleteUploadedFile();
+
+            return res.status(400).json({
+              ok: false,
+
+              message:
+                'กรุณาระบุเลขบัตรประชาชนเป้าหมาย 13 หลัก'
+            });
+
+          }
+
+
+          // =========================
+          // ตรวจหลักฐาน
+          // =========================
+
+          if (!req.file) {
+
+            return res.status(400).json({
+              ok: false,
+
+              message:
+                'กรุณาอัปโหลดภาพหลักฐานประกอบคำขอ'
+            });
+
+          }
+
+
+          // =========================
+          // ตั้งชื่อไฟล์หลักฐานใหม่
+          // =========================
+
+          const extMap = {
+            'image/jpeg': 'jpg',
+            'image/png': 'png',
+            'image/webp': 'webp'
+          };
+
+
+          const ext =
+            extMap[
+              req.file.mimetype
+            ] || 'jpg';
+
+
+          const fileName =
+            `base_${lineUser.userId}_${Date.now()}.${ext}`;
+
+
+          const finalPath =
+            path.join(
+              UPLOAD_DIR,
+              fileName
+            );
+
+
+          fs.renameSync(
+            req.file.path,
+            finalPath
+          );
+
+
+          savedFilePath =
+            finalPath;
+
+
+          // =========================
+          // ข้อมูลผู้ขอ
+          // =========================
+
+          const registeredName =
+            [
+              member?.rank,
+              member?.fullname
+            ]
+              .filter(Boolean)
+              .join(' ')
+              .trim() ||
+
+            member?.lineName ||
+
+            lineUser.displayName ||
+
+            '-';
+
+
+          // =========================
+          // REQUEST ID
+          // =========================
+
+          const requestId =
+            'BASE-' +
+            Date.now()
+              .toString(36)
+              .toUpperCase();
+
+
+          // =========================
+          // ข้อความ ADMIN
+          // =========================
+
+          const adminText =
+`🚨 รายการ BASE ใหม่
+
+เลขคำขอ: ${requestId}
+
+📱 หมายเลขเป้าหมาย: ${phone}
+📡 เครือข่าย: ${network}
+
+📁 ชื่อเคส/เหตุในการขอข้อมูล:
+${caseName}
+
+👤 ชื่อ-นามสกุลเป้าหมาย:
+${targetName}
+
+🪪 เลขบัตรเป้าหมาย:
+${citizenId}
+
+━━━━━━━━━━━━━━
+👮 ข้อมูลผู้ขอ
+
+ชื่อ LINE:
+${lineUser.displayName || member?.lineName || '-'}
+
+ชื่อที่สมัคร:
+${registeredName}
+
+เบอร์ที่สมัคร:
+${member?.phone || '-'}
+
+ตำแหน่ง:
+${member?.position || '-'}
+
+สังกัด:
+${member?.department || '-'}
+
+UID:
+${lineUser.userId}
+
+เวลาส่ง:
+${nowThai()}
+
+ตอบกลับสมาชิก:
+send#${lineUser.userId}#ข้อความที่ต้องการส่ง`;
+
+
+          // =========================
+          // URL รูปหลักฐาน
+          // =========================
+
+          const baseUrl =
+            BASE_URL ||
+            'https://memegabot.com';
+
+
+          const evidenceUrl =
+            `${baseUrl}/uploads/${fileName}`;
+
+
+          // =========================
+          // แจ้ง ADMIN
+          // =========================
+
+          await notifyAdmins([
+            {
+              type: 'text',
+
+              text:
+                limitLineMessage(
+                  adminText
+                )
+            },
+
+            {
+              type: 'image',
+
+              originalContentUrl:
+                evidenceUrl,
+
+              previewImageUrl:
+                evidenceUrl
+            }
+          ]);
+
+
+          // =========================
+          // สำเร็จ
+          // =========================
+
+          return res.json({
+            ok: true,
+
+            requestId,
+
+            message:
+              'รับข้อมูลคำขอ BASE เรียบร้อยแล้ว ระบบได้ส่งข้อมูลให้แอดมินตรวจสอบแล้ว'
+          });
+
+
+        } catch (err) {
+
+          deleteUploadedFile();
+
+
+          console.error(
+            'BASE LIFF REQUEST ERROR:',
+            err?.response?.data ||
+            err.message ||
+            err
+          );
+
+
+          return res.status(500).json({
+            ok: false,
+
+            message:
+              'ส่งคำขอ BASE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง'
+          });
+
+        }
+
+      }
+    );
+
+  }
+);
+
+// ==========================================
+// MEMBER BASE REQUEST : PAGE
+// ==========================================
+
+app.get(
+  '/member/base/request',
+  (req, res) => {
+
+    const lineUser =
+      req.session?.lineUser;
+
+
+    // =========================
+    // ยังไม่ได้ Login LINE
+    // =========================
+    if (!lineUser?.userId) {
+
+      return res.redirect(
+        '/line/login?next=%2Fmember%2Fbase%2Frequest'
+      );
+
+    }
+
+
+    // =========================
+    // ตรวจสมาชิก
+    // =========================
+    const db =
+      loadDB();
+
+    db.members =
+      db.members || {};
+
+
+    const member =
+      db.members[
+        lineUser.userId
+      ];
+
+
+    if (
+      !member ||
+      (
+        !isActiveMember(member) &&
+        !isAdmin(lineUser.userId)
+      )
+    ) {
+
+      return res
+        .status(403)
+        .send(
+          'บัญชีนี้ไม่มีสิทธิ์ส่งคำขอ BASE'
+        );
+
+    }
+
+
+    // =========================
+    // ส่งหน้าเว็บ
+    // =========================
+    res.send(`
+<!DOCTYPE html>
+
+<html lang="th">
+
+<head>
+
+  <meta charset="UTF-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0"
+  >
+
+  <title>
+    MEGABOT BASE REQUEST
+  </title>
+
+
+  <style>
+
+    * {
+      box-sizing: border-box;
+    }
+
+
+    body {
+      margin: 0;
+
+      min-height: 100vh;
+
+      font-family:
+        Arial,
+        sans-serif;
+
+      color: #e5e7eb;
+
+      background:
+        radial-gradient(
+          circle at top,
+          #172554 0%,
+          #0b1220 36%,
+          #050810 100%
+        );
+    }
+
+
+    .page {
+      width: 100%;
+
+      max-width: 560px;
+
+      margin: 0 auto;
+
+      padding:
+        28px 16px 55px;
+    }
+
+
+    /* =========================
+       BRAND
+    ========================= */
+
+    .brand {
+      text-align: center;
+
+      margin-bottom: 24px;
+    }
+
+
+    .brand-icon {
+      width: 64px;
+      height: 64px;
+
+      margin:
+        0 auto 13px;
+
+      display: flex;
+
+      align-items: center;
+      justify-content: center;
+
+      border-radius: 20px;
+
+      font-size: 29px;
+
+      background:
+        linear-gradient(
+          145deg,
+          #1d4ed8,
+          #2563eb
+        );
+
+      box-shadow:
+        0 15px 36px
+        rgba(37, 99, 235, .32);
+    }
+
+
+    .brand-title {
+      font-size: 21px;
+
+      font-weight: 800;
+
+      color: #ffffff;
+    }
+
+
+    .brand-subtitle {
+      margin-top: 6px;
+
+      font-size: 11px;
+
+      letter-spacing: 1.4px;
+
+      color: #94a3b8;
+    }
+
+
+    /* =========================
+       CARD
+    ========================= */
+
+    .card {
+      overflow: hidden;
+
+      border-radius: 24px;
+
+      background:
+        rgba(15, 23, 42, .94);
+
+      border:
+        1px solid
+        rgba(148, 163, 184, .14);
+
+      box-shadow:
+        0 26px 70px
+        rgba(0, 0, 0, .38);
+    }
+
+
+    .card-header {
+      padding: 21px;
+
+      border-bottom:
+        1px solid
+        rgba(148, 163, 184, .11);
+    }
+
+
+    .card-title {
+      font-size: 17px;
+
+      font-weight: 800;
+
+      color: #f8fafc;
+    }
+
+
+    .card-desc {
+      margin-top: 7px;
+
+      font-size: 12px;
+
+      line-height: 1.7;
+
+      color: #94a3b8;
+    }
+
+
+    .card-body {
+      padding: 20px;
+    }
+
+
+    /* =========================
+       FORM
+    ========================= */
+
+    .field {
+      margin-bottom: 18px;
+    }
+
+
+    .field-label {
+      display: block;
+
+      margin-bottom: 8px;
+
+      font-size: 12px;
+
+      font-weight: 700;
+
+      color: #cbd5e1;
+    }
+
+
+    .required {
+      color: #f87171;
+    }
+
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+
+      border:
+        1px solid
+        rgba(148, 163, 184, .18);
+
+      outline: none;
+
+      border-radius: 14px;
+
+      padding:
+        13px 14px;
+
+      font-size: 14px;
+
+      color: #f8fafc;
+
+      background:
+        rgba(2, 6, 23, .55);
+
+      transition:
+        border-color .2s ease,
+        box-shadow .2s ease;
+    }
+
+
+    input:focus,
+    select:focus,
+    textarea:focus {
+      border-color:
+        rgba(59, 130, 246, .70);
+
+      box-shadow:
+        0 0 0 3px
+        rgba(37, 99, 235, .12);
+    }
+
+
+    input::placeholder,
+    textarea::placeholder {
+      color: #64748b;
+    }
+
+
+    select option {
+      color: #111827;
+
+      background: #ffffff;
+    }
+
+
+    textarea {
+      min-height: 115px;
+
+      resize: vertical;
+
+      line-height: 1.6;
+    }
+
+
+    .helper {
+      margin-top: 7px;
+
+      font-size: 10px;
+
+      line-height: 1.6;
+
+      color: #64748b;
+    }
+
+
+    /* =========================
+       UPLOAD
+    ========================= */
+
+    .upload-box {
+      position: relative;
+
+      min-height: 190px;
+
+      display: flex;
+
+      align-items: center;
+      justify-content: center;
+
+      overflow: hidden;
+
+      text-align: center;
+
+      border-radius: 17px;
+
+      border:
+        1.5px dashed
+        rgba(96, 165, 250, .42);
+
+      background:
+        rgba(30, 41, 59, .48);
+
+      cursor: pointer;
+    }
+
+
+    .upload-box:active {
+      transform:
+        scale(.995);
+    }
+
+
+    .upload-placeholder {
+      padding: 25px;
+    }
+
+
+    .upload-icon {
+      font-size: 38px;
+    }
+
+
+    .upload-title {
+      margin-top: 11px;
+
+      font-size: 14px;
+
+      font-weight: 700;
+
+      color: #e2e8f0;
+    }
+
+
+    .upload-help {
+      margin-top: 7px;
+
+      font-size: 10px;
+
+      line-height: 1.7;
+
+      color: #94a3b8;
+    }
+
+
+    #evidence {
+      display: none;
+    }
+
+
+    #preview {
+      display: none;
+
+      width: 100%;
+
+      max-height: 390px;
+
+      object-fit: contain;
+
+      background: #020617;
+    }
+
+
+    .change-button {
+      display: none;
+
+      width: 100%;
+
+      margin-top: 10px;
+
+      min-height: 43px;
+
+      border-radius: 13px;
+
+      border:
+        1px solid
+        rgba(148, 163, 184, .18);
+
+      color: #cbd5e1;
+
+      background:
+        rgba(255, 255, 255, .035);
+
+      cursor: pointer;
+    }
+
+
+    /* =========================
+       SUBMIT
+    ========================= */
+
+    .submit-button {
+      width: 100%;
+
+      min-height: 55px;
+
+      margin-top: 8px;
+
+      border: 0;
+
+      border-radius: 15px;
+
+      font-size: 15px;
+
+      font-weight: 800;
+
+      color: #ffffff;
+
+      background:
+        linear-gradient(
+          135deg,
+          #2563eb,
+          #1d4ed8
+        );
+
+      box-shadow:
+        0 13px 30px
+        rgba(37, 99, 235, .30);
+
+      cursor: pointer;
+    }
+
+
+    .submit-button:disabled {
+      cursor: not-allowed;
+
+      opacity: .45;
+
+      box-shadow: none;
+    }
+
+
+    /* =========================
+       MESSAGE
+    ========================= */
+
+    .loading {
+      display: none;
+
+      margin-top: 16px;
+
+      padding: 15px;
+
+      text-align: center;
+
+      border-radius: 14px;
+
+      font-size: 12px;
+
+      color: #bfdbfe;
+
+      background:
+        rgba(37, 99, 235, .08);
+
+      border:
+        1px solid
+        rgba(37, 99, 235, .16);
+    }
+
+
+    .error-box {
+      display: none;
+
+      margin-top: 16px;
+
+      padding: 15px;
+
+      border-radius: 14px;
+
+      font-size: 12px;
+
+      line-height: 1.7;
+
+      color: #fecaca;
+
+      background:
+        rgba(239, 68, 68, .07);
+
+      border:
+        1px solid
+        rgba(239, 68, 68, .18);
+    }
+
+
+    .success-box {
+      display: none;
+
+      margin-top: 16px;
+
+      padding: 18px;
+
+      border-radius: 16px;
+
+      font-size: 13px;
+
+      line-height: 1.7;
+
+      color: #bbf7d0;
+
+      background:
+        rgba(34, 197, 94, .07);
+
+      border:
+        1px solid
+        rgba(34, 197, 94, .18);
+    }
+
+
+    /* =========================
+       WARNING
+    ========================= */
+
+    .warning {
+      margin-top: 18px;
+
+      padding: 14px;
+
+      border-radius: 14px;
+
+      font-size: 10px;
+
+      line-height: 1.7;
+
+      color: #94a3b8;
+
+      background:
+        rgba(255, 255, 255, .025);
+
+      border:
+        1px solid
+        rgba(148, 163, 184, .08);
+    }
+
+
+    @media (max-width: 480px) {
+
+      .page {
+        padding:
+          20px 12px 40px;
+      }
+
+
+      .card {
+        border-radius: 20px;
+      }
+
+
+      .card-body {
+        padding: 16px;
+      }
+
+    }
+
+  </style>
+
+</head>
+
+
+<body>
+
+
+<div class="page">
+
+
+  <!-- =========================
+       BRAND
+  ========================== -->
+
+  <div class="brand">
+
+    <div class="brand-icon">
+      📡
+    </div>
+
+    <div class="brand-title">
+      MEGABOT BASE REQUEST
+    </div>
+
+    <div class="brand-subtitle">
+      SIGNAL REQUEST SYSTEM
+    </div>
+
+  </div>
+
+
+  <!-- =========================
+       CARD
+  ========================== -->
+
+  <div class="card">
+
+
+    <div class="card-header">
+
+      <div class="card-title">
+        แบบฟอร์มขอข้อมูลสัญญาณ
+      </div>
+
+      <div class="card-desc">
+        กรุณากรอกข้อมูลตามความเป็นจริง
+        และแนบหลักฐานประกอบคำขอให้ครบถ้วน
+      </div>
+
+    </div>
+
+
+    <div class="card-body">
+
+
+      <form id="baseForm">
+
+
+        <!-- ======================
+             PHONE
+        ======================= -->
+
+        <div class="field">
+
+          <label class="field-label">
+
+            หมายเลขโทรศัพท์เป้าหมาย
+
+            <span class="required">
+              *
+            </span>
+
+          </label>
+
+
+          <input
+            type="tel"
+            id="phone"
+            name="phone"
+            maxlength="10"
+            inputmode="numeric"
+            placeholder="เช่น 0812345678"
+            required
+          >
+
+
+          <div class="helper">
+            กรุณาระบุหมายเลขโทรศัพท์ 10 หลัก
+          </div>
+
+        </div>
+
+
+        <!-- ======================
+             NETWORK
+        ======================= -->
+
+        <div class="field">
+
+          <label class="field-label">
+
+            เครือข่ายสัญญาณเป้าหมาย
+
+            <span class="required">
+              *
+            </span>
+
+          </label>
+
+
+          <select
+            id="network"
+            name="network"
+            required
+          >
+
+            <option value="">
+              -- เลือกเครือข่าย --
+            </option>
+
+            <option value="AIS">
+              AIS
+            </option>
+
+            <option value="TRUE">
+              TRUE
+            </option>
+
+            <option value="DTAC">
+              DTAC
+            </option>
+
+          </select>
+
+
+          <div class="helper">
+            เลือกเครือข่ายของหมายเลขเป้าหมาย
+          </div>
+
+        </div>
+
+
+        <!-- ======================
+             CASE
+        ======================= -->
+
+        <div class="field">
+
+          <label class="field-label">
+
+            ชื่อเคส / เหตุในการขอข้อมูล
+
+            <span class="required">
+              *
+            </span>
+
+          </label>
+
+
+          <textarea
+            id="caseName"
+            name="caseName"
+            maxlength="500"
+            placeholder="เช่น เคสหมายจับ / ชื่อเคสตามประจำวัน / เคสสดให้แจ้งตามจริง"
+            required
+          ></textarea>
+
+
+          <div class="helper">
+            กรุณาระบุเหตุและรายละเอียดเคสให้ชัดเจน
+          </div>
+
+        </div>
+
+
+        <!-- ======================
+             TARGET NAME
+        ======================= -->
+
+        <div class="field">
+
+          <label class="field-label">
+
+            ชื่อ - นามสกุลเป้าหมาย
+
+            <span class="required">
+              *
+            </span>
+
+          </label>
+
+
+          <input
+            type="text"
+            id="targetName"
+            name="targetName"
+            maxlength="200"
+            placeholder="กรอกชื่อ - นามสกุลเป้าหมาย"
+            required
+          >
+
+        </div>
+
+
+        <!-- ======================
+             CITIZEN ID
+        ======================= -->
+
+        <div class="field">
+
+          <label class="field-label">
+
+            เลขบัตรประชาชนเป้าหมาย
+
+            <span class="required">
+              *
+            </span>
+
+          </label>
+
+
+          <input
+            type="text"
+            id="citizenId"
+            name="citizenId"
+            maxlength="13"
+            inputmode="numeric"
+            placeholder="เลขบัตรประชาชน 13 หลัก"
+            required
+          >
+
+        </div>
+
+
+        <!-- ======================
+             EVIDENCE
+        ======================= -->
+
+        <div class="field">
+
+          <label class="field-label">
+
+            ภาพหลักฐานประกอบคำขอ
+
+            <span class="required">
+              *
+            </span>
+
+          </label>
+
+
+          <label
+            class="upload-box"
+            for="evidence"
+          >
+
+
+            <div
+              class="upload-placeholder"
+              id="uploadPlaceholder"
+            >
+
+              <div class="upload-icon">
+                📎
+              </div>
+
+
+              <div class="upload-title">
+                แตะเพื่ออัปโหลดหลักฐาน
+              </div>
+
+
+              <div class="upload-help">
+
+                เช่น ภาพหมายจับ / ปจว. /
+                หลักฐานประกอบเคส
+
+                <br>
+
+                รองรับ JPG, PNG และ WEBP
+
+              </div>
+
+            </div>
+
+
+            <img
+              id="preview"
+              alt="Evidence preview"
+            >
+
+
+          </label>
+
+
+          <input
+            type="file"
+            id="evidence"
+            name="evidence"
+            accept="image/jpeg,image/png,image/webp"
+            required
+          >
+
+
+          <button
+            type="button"
+            id="changeImage"
+            class="change-button"
+          >
+            เลือกภาพใหม่
+          </button>
+
+
+        </div>
+
+
+        <!-- ======================
+             SUBMIT
+        ======================= -->
+
+        <button
+          type="submit"
+          class="submit-button"
+          id="submitButton"
+        >
+          📡 ส่งข้อมูลขอสัญญาณ
+        </button>
+
+
+      </form>
+
+
+      <!-- ======================
+           LOADING
+      ======================= -->
+
+      <div
+        class="loading"
+        id="loading"
+      >
+        ⏳ กำลังส่งข้อมูลให้แอดมิน
+        กรุณารอสักครู่...
+      </div>
+
+
+      <!-- ======================
+           ERROR
+      ======================= -->
+
+      <div
+        class="error-box"
+        id="errorBox"
+      ></div>
+
+
+      <!-- ======================
+           SUCCESS
+      ======================= -->
+
+      <div
+        class="success-box"
+        id="successBox"
+      ></div>
+
+
+      <!-- ======================
+           WARNING
+      ======================= -->
+
+      <div class="warning">
+
+        🔐 กรุณาใช้ข้อมูลและหลักฐานตามวัตถุประสงค์
+        ของระบบเท่านั้น
+
+        <br><br>
+
+        ตรวจสอบข้อมูลทุกช่องให้ถูกต้อง
+        ก่อนกดส่งคำขอ
+
+      </div>
+
+
+    </div>
+
+  </div>
+
+</div>
+
+
+<script>
+
+
+const baseForm =
+  document.getElementById(
+    'baseForm'
+  );
+
+
+const phone =
+  document.getElementById(
+    'phone'
+  );
+
+
+const citizenId =
+  document.getElementById(
+    'citizenId'
+  );
+
+
+const evidence =
+  document.getElementById(
+    'evidence'
+  );
+
+
+const preview =
+  document.getElementById(
+    'preview'
+  );
+
+
+const uploadPlaceholder =
+  document.getElementById(
+    'uploadPlaceholder'
+  );
+
+
+const changeImage =
+  document.getElementById(
+    'changeImage'
+  );
+
+
+const submitButton =
+  document.getElementById(
+    'submitButton'
+  );
+
+
+const loading =
+  document.getElementById(
+    'loading'
+  );
+
+
+const errorBox =
+  document.getElementById(
+    'errorBox'
+  );
+
+
+const successBox =
+  document.getElementById(
+    'successBox'
+  );
+
+
+let previewUrl =
+  null;
+
+
+// =========================
+// PHONE ตัวเลขเท่านั้น
+// =========================
+
+phone.addEventListener(
+  'input',
+  function () {
+
+    phone.value =
+      phone.value
+        .replace(/\\D/g, '')
+        .slice(0, 10);
+
+  }
+);
+
+
+// =========================
+// CITIZEN ID ตัวเลขเท่านั้น
+// =========================
+
+citizenId.addEventListener(
+  'input',
+  function () {
+
+    citizenId.value =
+      citizenId.value
+        .replace(/\\D/g, '')
+        .slice(0, 13);
+
+  }
+);
+
+
+// =========================
+// PREVIEW IMAGE
+// =========================
+
+evidence.addEventListener(
+  'change',
+  function () {
+
+    const file =
+      evidence.files &&
+      evidence.files[0];
+
+
+    if (!file) {
+      return;
+    }
+
+
+    // จำกัด 10 MB
+    if (
+      file.size >
+      10 * 1024 * 1024
+    ) {
+
+      evidence.value =
+        '';
+
+
+      errorBox.textContent =
+        'ไฟล์หลักฐานต้องมีขนาดไม่เกิน 10 MB';
+
+
+      errorBox.style.display =
+        'block';
+
+
+      return;
+
+    }
+
+
+    if (previewUrl) {
+
+      URL.revokeObjectURL(
+        previewUrl
+      );
+
+    }
+
+
+    previewUrl =
+      URL.createObjectURL(
+        file
+      );
+
+
+    preview.src =
+      previewUrl;
+
+
+    preview.style.display =
+      'block';
+
+
+    uploadPlaceholder.style.display =
+      'none';
+
+
+    changeImage.style.display =
+      'block';
+
+
+    errorBox.style.display =
+      'none';
+
+  }
+);
+
+
+// =========================
+// CHANGE IMAGE
+// =========================
+
+changeImage.addEventListener(
+  'click',
+  function () {
+
+    evidence.click();
+
+  }
+);
+
+
+// =========================
+// SUBMIT FORM
+// =========================
+
+baseForm.addEventListener(
+  'submit',
+  async function (event) {
+
+    event.preventDefault();
+
+
+    errorBox.style.display =
+      'none';
+
+
+    successBox.style.display =
+      'none';
+
+
+    // =====================
+    // PHONE
+    // =====================
+
+    if (
+      !/^0\\d{9}$/.test(
+        phone.value
+      )
+    ) {
+
+      errorBox.textContent =
+        'กรุณาระบุหมายเลขโทรศัพท์เป้าหมาย 10 หลัก';
+
+
+      errorBox.style.display =
+        'block';
+
+
+      return;
+
+    }
+
+
+    // =====================
+    // CITIZEN ID
+    // =====================
+
+    if (
+      !/^\\d{13}$/.test(
+        citizenId.value
+      )
+    ) {
+
+      errorBox.textContent =
+        'กรุณาระบุเลขบัตรประชาชนเป้าหมาย 13 หลัก';
+
+
+      errorBox.style.display =
+        'block';
+
+
+      return;
+
+    }
+
+
+    // =====================
+    // IMAGE
+    // =====================
+
+    if (
+      !evidence.files ||
+      !evidence.files[0]
+    ) {
+
+      errorBox.textContent =
+        'กรุณาอัปโหลดภาพหลักฐานประกอบคำขอ';
+
+
+      errorBox.style.display =
+        'block';
+
+
+      return;
+
+    }
+
+
+    const formData =
+      new FormData(
+        baseForm
+      );
+
+
+    submitButton.disabled =
+      true;
+
+
+    loading.style.display =
+      'block';
+
+
+    try {
+
+
+      const response =
+        await fetch(
+          '/member/base/request/submit',
+          {
+
+            method:
+              'POST',
+
+            credentials:
+              'same-origin',
+
+            body:
+              formData
+
+          }
+        );
+
+
+      const data =
+        await response.json();
+
+
+      // =====================
+      // LOGIN หมดอายุ
+      // =====================
+
+      if (
+        response.status === 401 &&
+        data.loginUrl
+      ) {
+
+        window.location.href =
+          data.loginUrl;
+
+        return;
+
+      }
+
+
+      if (!data.ok) {
+
+        throw new Error(
+          data.message ||
+          'ส่งคำขอไม่สำเร็จ'
+        );
+
+      }
+
+
+      // =====================
+      // SUCCESS
+      // =====================
+
+      successBox.textContent =
+        '✅ ' +
+        data.message +
+        '\\n\\nเลขคำขอ: ' +
+        data.requestId;
+
+
+      successBox.style.whiteSpace =
+        'pre-line';
+
+
+      successBox.style.display =
+        'block';
+
+
+      // ล้างฟอร์ม
+      baseForm.reset();
+
+
+      preview.style.display =
+        'none';
+
+
+      preview.removeAttribute(
+        'src'
+      );
+
+
+      uploadPlaceholder.style.display =
+        'block';
+
+
+      changeImage.style.display =
+        'none';
+
+
+      if (previewUrl) {
+
+        URL.revokeObjectURL(
+          previewUrl
+        );
+
+        previewUrl =
+          null;
+
+      }
+
+
+      window.scrollTo({
+        top: 0,
+        behavior: 'smooth'
+      });
+
+
+    } catch (err) {
+
+
+      errorBox.textContent =
+        err.message ||
+        'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง';
+
+
+      errorBox.style.display =
+        'block';
+
+
+    } finally {
+
+
+      loading.style.display =
+        'none';
+
+
+      submitButton.disabled =
+        false;
+
+    }
+
+  }
+);
+
+
+</script>
+
+
+</body>
+
+</html>
+    `);
+
+  }
+);
+
+// ==========================================
+// MEMBER TOOL PAGE : IMAGE / PLATE OCR
+// ==========================================
+
+app.get(
+  '/member/tools/image',
+  (req, res) => {
+
+    const lineUser =
+      req.session?.lineUser;
+
+
+    // ยังไม่ได้ Login LINE
+    if (!lineUser?.userId) {
+
+      return res.redirect(
+        '/line/login?next=%2Fmember%2Ftools%2Fimage'
+      );
+
+    }
+
+
+    const db =
+      loadDB();
+
+    db.members =
+      db.members || {};
+
+    const member =
+      db.members[lineUser.userId];
+
+
+    if (!member) {
+
+      return res.status(403).send(
+        'ไม่พบข้อมูลสมาชิก'
+      );
+
+    }
+
+
+    if (!isActiveMember(member)) {
+
+      return res.status(403).send(
+        'สมาชิกยังไม่ได้รับอนุมัติ หรือหมดอายุแล้ว'
+      );
+
+    }
+
+
+    res.send(`
+<!DOCTYPE html>
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0, maximum-scale=1.0"
+>
+
+<title>MEGABOT - Plate OCR</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+
+  min-height: 100vh;
+
+  font-family:
+    Arial,
+    sans-serif;
+
+  color: #e5e7eb;
+
+  background:
+    radial-gradient(
+      circle at top,
+      #172554 0,
+      #0b1220 38%,
+      #050810 100%
+    );
+}
+
+
+.page {
+  width: 100%;
+
+  max-width: 520px;
+
+  margin: 0 auto;
+
+  padding:
+    28px 18px 50px;
+}
+
+
+.brand {
+  text-align: center;
+
+  margin-bottom: 24px;
+}
+
+
+.brand-icon {
+  width: 62px;
+  height: 62px;
+
+  margin:
+    0 auto 12px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 20px;
+
+  font-size: 30px;
+
+  background:
+    linear-gradient(
+      145deg,
+      #1d4ed8,
+      #2563eb
+    );
+
+  box-shadow:
+    0 14px 35px
+    rgba(37, 99, 235, .35);
+}
+
+
+.brand-title {
+  font-size: 21px;
+
+  font-weight: 800;
+
+  color: #f8fafc;
+}
+
+
+.brand-subtitle {
+  margin-top: 6px;
+
+  font-size: 12px;
+
+  color: #94a3b8;
+}
+
+
+.card {
+  overflow: hidden;
+
+  border-radius: 24px;
+
+  background:
+    rgba(15, 23, 42, .92);
+
+  border:
+    1px solid
+    rgba(148, 163, 184, .14);
+
+  box-shadow:
+    0 24px 70px
+    rgba(0, 0, 0, .38);
+}
+
+
+.card-head {
+  padding: 21px;
+
+  border-bottom:
+    1px solid
+    rgba(148, 163, 184, .11);
+}
+
+
+.card-title {
+  font-size: 17px;
+
+  font-weight: 800;
+
+  color: #ffffff;
+}
+
+
+.card-desc {
+  margin-top: 7px;
+
+  font-size: 12px;
+
+  line-height: 1.6;
+
+  color: #94a3b8;
+}
+
+
+.card-body {
+  padding: 20px;
+}
+
+
+.upload-box {
+  position: relative;
+
+  min-height: 230px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  text-align: center;
+
+  overflow: hidden;
+
+  border-radius: 18px;
+
+  border:
+    1.5px dashed
+    rgba(96, 165, 250, .45);
+
+  background:
+    rgba(30, 41, 59, .55);
+
+  cursor: pointer;
+}
+
+
+.upload-box:active {
+  transform:
+    scale(.995);
+}
+
+
+.upload-placeholder {
+  padding: 28px;
+}
+
+
+.upload-icon {
+  font-size: 42px;
+}
+
+
+.upload-title {
+  margin-top: 13px;
+
+  font-size: 15px;
+
+  font-weight: 700;
+
+  color: #f8fafc;
+}
+
+
+.upload-help {
+  margin-top: 7px;
+
+  font-size: 11px;
+
+  line-height: 1.6;
+
+  color: #94a3b8;
+}
+
+
+#preview {
+  width: 100%;
+  height: 100%;
+
+  min-height: 230px;
+
+  max-height: 420px;
+
+  object-fit: contain;
+
+  display: none;
+
+  background: #020617;
+}
+
+
+#plateImage {
+  display: none;
+}
+
+
+.actions {
+  margin-top: 16px;
+}
+
+
+.scan-button {
+  width: 100%;
+
+  min-height: 52px;
+
+  border: 0;
+
+  border-radius: 15px;
+
+  font-size: 15px;
+
+  font-weight: 800;
+
+  color: #ffffff;
+
+  background:
+    linear-gradient(
+      135deg,
+      #2563eb,
+      #1d4ed8
+    );
+
+  box-shadow:
+    0 12px 28px
+    rgba(37, 99, 235, .30);
+
+  cursor: pointer;
+}
+
+
+.scan-button:disabled {
+  cursor: not-allowed;
+
+  opacity: .42;
+
+  box-shadow: none;
+}
+
+
+.change-button {
+  width: 100%;
+
+  margin-top: 10px;
+
+  min-height: 44px;
+
+  border-radius: 14px;
+
+  border:
+    1px solid
+    rgba(148, 163, 184, .18);
+
+  color: #cbd5e1;
+
+  background:
+    rgba(255, 255, 255, .035);
+
+  display: none;
+
+  cursor: pointer;
+}
+
+
+.loading {
+  display: none;
+
+  margin-top: 18px;
+
+  padding: 16px;
+
+  border-radius: 14px;
+
+  text-align: center;
+
+  font-size: 13px;
+
+  color: #bfdbfe;
+
+  background:
+    rgba(37, 99, 235, .08);
+
+  border:
+    1px solid
+    rgba(37, 99, 235, .16);
+}
+
+
+.result-box {
+  display: none;
+
+  margin-top: 18px;
+
+  padding: 18px;
+
+  border-radius: 17px;
+
+  background:
+    rgba(2, 6, 23, .60);
+
+  border:
+    1px solid
+    rgba(34, 197, 94, .18);
+}
+
+
+.result-title {
+  font-size: 13px;
+
+  font-weight: 800;
+
+  color: #4ade80;
+
+  margin-bottom: 12px;
+}
+
+
+.result-text {
+  white-space: pre-wrap;
+
+  word-break: break-word;
+
+  font-size: 13px;
+
+  line-height: 1.8;
+
+  color: #e2e8f0;
+}
+
+
+.error-box {
+  display: none;
+
+  margin-top: 18px;
+
+  padding: 15px;
+
+  border-radius: 14px;
+
+  font-size: 12px;
+
+  line-height: 1.6;
+
+  color: #fecaca;
+
+  background:
+    rgba(239, 68, 68, .07);
+
+  border:
+    1px solid
+    rgba(239, 68, 68, .18);
+}
+
+
+.security {
+  margin-top: 18px;
+
+  padding: 14px;
+
+  border-radius: 14px;
+
+  font-size: 11px;
+
+  line-height: 1.7;
+
+  color: #94a3b8;
+
+  background:
+    rgba(255, 255, 255, .025);
+
+  border:
+    1px solid
+    rgba(148, 163, 184, .08);
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<div class="page">
+
+
+  <div class="brand">
+
+    <div class="brand-icon">
+      🚘
+    </div>
+
+    <div class="brand-title">
+      MEGABOT
+    </div>
+
+    <div class="brand-subtitle">
+      VEHICLE INTELLIGENCE SYSTEM
+    </div>
+
+  </div>
+
+
+  <div class="card">
+
+    <div class="card-head">
+
+      <div class="card-title">
+        อ่านป้ายทะเบียนรถ
+      </div>
+
+      <div class="card-desc">
+        เลือกรูปรถหรือป้ายทะเบียน
+        ระบบจะวิเคราะห์ข้อมูลจากภาพโดยอัตโนมัติ
+      </div>
+
+    </div>
+
+
+    <div class="card-body">
+
+
+      <label
+        class="upload-box"
+        for="plateImage"
+        id="uploadBox"
+      >
+
+        <div
+          class="upload-placeholder"
+          id="uploadPlaceholder"
+        >
+
+          <div class="upload-icon">
+            📷
+          </div>
+
+          <div class="upload-title">
+            แตะเพื่อเลือกรูปภาพ
+          </div>
+
+          <div class="upload-help">
+            ถ่ายภาพจากกล้อง
+            หรือเลือกรูปจากอัลบั้ม<br>
+            รองรับ JPG, PNG และ WEBP
+          </div>
+
+        </div>
+
+
+        <img
+          id="preview"
+          alt="preview"
+        >
+
+      </label>
+
+
+      <input
+        type="file"
+        id="plateImage"
+        accept="image/jpeg,image/png,image/webp"
+        capture="environment"
+      >
+
+
+      <div class="actions">
+
+        <button
+          type="button"
+          class="scan-button"
+          id="scanButton"
+          disabled
+        >
+          🔎 ตรวจสอบป้ายทะเบียน
+        </button>
+
+
+        <button
+          type="button"
+          class="change-button"
+          id="changeButton"
+        >
+          เลือกรูปใหม่
+        </button>
+
+      </div>
+
+
+      <div
+        class="loading"
+        id="loading"
+      >
+        ⏳ กำลังวิเคราะห์ภาพ
+        กรุณารอสักครู่...
+      </div>
+
+
+      <div
+        class="error-box"
+        id="errorBox"
+      ></div>
+
+
+      <div
+        class="result-box"
+        id="resultBox"
+      >
+
+        <div class="result-title">
+          ✅ ผลการตรวจสอบ
+        </div>
+
+        <div
+          class="result-text"
+          id="resultText"
+        ></div>
+
+      </div>
+
+
+      <div class="security">
+        🔐 รูปภาพที่อัปโหลดใช้สำหรับการประมวลผลเท่านั้น
+        และระบบจะลบไฟล์ชั่วคราวหลังจากประมวลผลเสร็จ
+      </div>
+
+
+    </div>
+
+  </div>
+
+</div>
+
+
+<script>
+
+const plateImage =
+  document.getElementById(
+    'plateImage'
+  );
+
+const preview =
+  document.getElementById(
+    'preview'
+  );
+
+const uploadPlaceholder =
+  document.getElementById(
+    'uploadPlaceholder'
+  );
+
+const scanButton =
+  document.getElementById(
+    'scanButton'
+  );
+
+const changeButton =
+  document.getElementById(
+    'changeButton'
+  );
+
+const loading =
+  document.getElementById(
+    'loading'
+  );
+
+const resultBox =
+  document.getElementById(
+    'resultBox'
+  );
+
+const resultText =
+  document.getElementById(
+    'resultText'
+  );
+
+const errorBox =
+  document.getElementById(
+    'errorBox'
+  );
+
+
+let selectedFile = null;
+
+let previewUrl = null;
+
+
+plateImage.addEventListener(
+  'change',
+  function () {
+
+    const file =
+      plateImage.files &&
+      plateImage.files[0];
+
+
+    if (!file) {
+      return;
+    }
+
+
+    if (
+      file.size >
+      10 * 1024 * 1024
+    ) {
+
+      plateImage.value = '';
+
+      selectedFile = null;
+
+      errorBox.style.display =
+        'block';
+
+      errorBox.textContent =
+        'ไฟล์ต้องมีขนาดไม่เกิน 10 MB';
+
+      return;
+    }
+
+
+    selectedFile = file;
+
+
+    if (previewUrl) {
+      URL.revokeObjectURL(
+        previewUrl
+      );
+    }
+
+
+    previewUrl =
+      URL.createObjectURL(file);
+
+
+    preview.src =
+      previewUrl;
+
+    preview.style.display =
+      'block';
+
+    uploadPlaceholder.style.display =
+      'none';
+
+    scanButton.disabled =
+      false;
+
+    changeButton.style.display =
+      'block';
+
+    errorBox.style.display =
+      'none';
+
+    resultBox.style.display =
+      'none';
+
+  }
+);
+
+
+changeButton.addEventListener(
+  'click',
+  function () {
+
+    plateImage.click();
+
+  }
+);
+
+
+scanButton.addEventListener(
+  'click',
+  async function () {
+
+    if (!selectedFile) {
+      return;
+    }
+
+
+    scanButton.disabled =
+      true;
+
+    loading.style.display =
+      'block';
+
+    errorBox.style.display =
+      'none';
+
+    resultBox.style.display =
+      'none';
+
+
+    const formData =
+      new FormData();
+
+    formData.append(
+      'image',
+      selectedFile
+    );
+
+
+    try {
+
+      const response =
+        await fetch(
+          '/member/tools/plate-ocr',
+          {
+            method: 'POST',
+
+            credentials:
+              'same-origin',
+
+            body:
+              formData
+          }
+        );
+
+
+      const data =
+        await response.json();
+
+
+      if (
+        response.status === 401 &&
+        data.loginUrl
+      ) {
+
+        window.location.href =
+          data.loginUrl;
+
+        return;
+      }
+
+
+      if (!data.ok) {
+
+        throw new Error(
+          data.message ||
+          'ไม่สามารถตรวจสอบรูปภาพได้'
+        );
+
+      }
+
+
+      resultText.textContent =
+        data.result ||
+        'ไม่พบข้อมูล';
+
+
+      resultBox.style.display =
+        'block';
+
+
+    } catch (err) {
+
+      errorBox.textContent =
+        err.message ||
+        'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง';
+
+      errorBox.style.display =
+        'block';
+
+
+    } finally {
+
+      loading.style.display =
+        'none';
+
+      scanButton.disabled =
+        false;
+
+    }
+
+  }
+);
+
+</script>
+
+
+</body>
+</html>
+    `);
+
+  }
+);
+
+// =====================================
+// แปลง LINE Flex -> ข้อความสำหรับหน้าเว็บ
+// =====================================
+
+function flexToWebText(message) {
+
+  const lines = [];
+
+  function walk(node) {
+
+    if (!node) return;
+
+    if (Array.isArray(node)) {
+
+      node.forEach(walk);
+      return;
+
+    }
+
+    if (
+      typeof node !== 'object'
+    ) {
+      return;
+    }
+
+    if (
+      node.type === 'text' &&
+      typeof node.text === 'string'
+    ) {
+
+      const text =
+        node.text.trim();
+
+      if (text) {
+        lines.push(text);
+      }
+    }
+
+    Object.values(node)
+      .forEach(walk);
+  }
+
+
+  walk(message);
+
+  return lines
+    .join('\n')
+    .trim();
+}
+
+// =====================================
+// MEMBER SEARCH : COMMAND API
+// =====================================
+
+app.post(
+  '/member/search/command',
+  express.json(),
+  async (req, res) => {
+
+    const lineUser =
+      req.session.lineUser;
+
+
+    // =========================
+    // ตรวจ LINE Login
+    // =========================
+
+    if (!lineUser?.userId) {
+
+      return res
+        .status(401)
+        .json({
+          ok: false,
+          message:
+            'กรุณาเข้าสู่ระบบ LINE ก่อน'
+        });
+    }
+
+
+    const userId =
+      lineUser.userId;
+
+
+    const db =
+      loadDB();
+
+
+    const member =
+      db.members?.[userId];
+
+
+    // =========================
+    // ตรวจสมาชิก
+    // =========================
+
+    if (!member) {
+
+      return res
+        .status(403)
+        .json({
+          ok: false,
+          message:
+            'ไม่พบข้อมูลสมาชิก'
+        });
+    }
+
+
+    if (
+      member.status !==
+      'approved'
+    ) {
+
+      return res
+        .status(403)
+        .json({
+          ok: false,
+          message:
+            'ยังไม่มีสิทธิ์ใช้งาน กรุณาติดต่อแอดมิน'
+        });
+    }
+
+
+    if (
+      !member.expireAt ||
+      isExpired(
+        member.expireAt
+      )
+    ) {
+
+      return res
+        .status(403)
+        .json({
+          ok: false,
+          message:
+            'สมาชิกหมดอายุ กรุณาติดต่อแอดมิน'
+        });
+    }
+
+
+    // =========================
+    // รับคำสั่ง
+    // =========================
+
+    const command =
+      String(
+        req.body?.command ||
+        ''
+      )
+        .trim();
+
+
+    if (!command) {
+
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          message:
+            'กรุณาระบุข้อมูลค้นหา'
+        });
+    }
+
+
+    try {
+
+      // =====================================
+      // ATM
+      // =====================================
+
+      if (
+        command
+          .toLowerCase()
+          .startsWith('atm%')
+      ) {
+
+        const keyword =
+          command
+            .replace(
+              /^atm%/i,
+              ''
+            )
+            .trim();
+
+
+        if (!keyword) {
+
+          return res.json({
+            ok: false,
+            message:
+              'กรุณาระบุรหัสตู้ ATM'
+          });
+        }
+
+
+        const results =
+          searchAtmDatabase(
+            keyword
+          );
+
+
+        const message =
+          formatAtmSearchResult(
+            results,
+            keyword
+          );
+
+
+        return res.json({
+          ok: true,
+          message
+        });
+      }
+
+
+      // =====================================
+      // PEA : peac%
+      // ค้นจากเลข CA
+      // =====================================
+
+      if (
+        command
+          .toLowerCase()
+          .startsWith('peac%')
+      ) {
+
+        const ca =
+          command
+            .replace(
+              /^peac%/i,
+              ''
+            )
+            .trim();
+
+
+        if (!ca) {
+
+          return res.json({
+            ok: false,
+            message:
+              'กรุณาระบุเลข CA'
+          });
+        }
+
+
+        const data =
+          await fetchPEAApi({
+            peac: ca
+          });
+
+
+        const flex =
+          buildPEANFlex(
+            data,
+            'ข้อมูลมิเตอร์ไฟฟ้า PEA',
+            0
+          );
+
+
+        const message =
+          flexToWebText(
+            flex
+          );
+
+
+        return res.json({
+          ok: true,
+          message:
+            message ||
+            'ไม่พบข้อมูล'
+        });
+      }
+
+
+      // =====================================
+      // PEA : pean%
+      // ค้นจากชื่อ-นามสกุล
+      // =====================================
+
+      if (
+        command
+          .toLowerCase()
+          .startsWith('pean%')
+      ) {
+
+        const name =
+          command
+            .replace(
+              /^pean%/i,
+              ''
+            )
+            .trim();
+
+
+        if (!name) {
+
+          return res.json({
+            ok: false,
+            message:
+              'กรุณาระบุชื่อและนามสกุล'
+          });
+        }
+
+
+        const data =
+          await fetchPEAApi({
+            pean: name
+          });
+
+
+        const flex =
+          buildPEANFlex(
+            data,
+            'ข้อมูลมิเตอร์ไฟฟ้าตามชื่อ',
+            0,
+            name
+          );
+
+
+        const message =
+          flexToWebText(
+            flex
+          );
+
+
+        return res.json({
+          ok: true,
+          message:
+            message ||
+            'ไม่พบข้อมูล'
+        });
+      }
+
+
+      // =====================================
+      // PEA : peau%
+      // ค้นจากที่อยู่
+      // =====================================
+
+      if (
+        command
+          .toLowerCase()
+          .startsWith('peau%')
+      ) {
+
+        const address =
+          command
+            .replace(
+              /^peau%/i,
+              ''
+            )
+            .trim();
+
+
+        if (!address) {
+
+          return res.json({
+            ok: false,
+            message:
+              'กรุณาระบุที่อยู่'
+          });
+        }
+
+
+        const data =
+          await fetchPEAApi({
+            peau: address
+          });
+
+
+        const flex =
+          buildPEAUFlex(
+            data,
+            0
+          );
+
+
+        const message =
+          flexToWebText(
+            flex
+          );
+
+
+        return res.json({
+          ok: true,
+          message:
+            message ||
+            'ไม่พบข้อมูล'
+        });
+      }
+
+
+      // =====================================
+      // PEA : peab%
+      // ประวัติการใช้ไฟ
+      // =====================================
+
+      if (
+        command
+          .toLowerCase()
+          .startsWith('peab%')
+      ) {
+
+        const input =
+          command
+            .replace(
+              /^peab%/i,
+              ''
+            )
+            .trim();
+
+
+        const parts =
+          input
+            .split(/\s+/)
+            .filter(Boolean);
+
+
+        const ca =
+          parts[0];
+
+
+        const peano =
+          parts[1];
+
+
+        if (
+          !ca ||
+          !peano
+        ) {
+
+          return res.json({
+            ok: false,
+
+            message:
+`กรุณาระบุข้อมูลให้ครบ
+
+ตัวอย่าง
+123456789012 1234567890`
+          });
+        }
+
+
+        const data =
+          await fetchPEAApi({
+            peab: ca,
+            peano
+          });
+
+
+        const message =
+          formatPEABillHistory(
+            data,
+            ca,
+            peano
+          );
+
+
+        return res.json({
+          ok: true,
+          message
+        });
+      }
+
+
+      // =====================================
+      // ยังไม่ได้เปิดคำสั่งนี้
+      // =====================================
+
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          message:
+            'คำสั่งนี้ยังไม่เปิดใช้งานบนหน้าเว็บ'
+        });
+
+
+    } catch (err) {
+
+      console.error(
+        'WEB COMMAND ERROR:',
+        err?.response?.data ||
+        err.message
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+
+          message:
+            'ระบบค้นหาขัดข้อง กรุณาลองใหม่อีกครั้ง'
+        });
+
+    }
+
+  }
+);
+
+// =====================================
+// MEMBER SEARCH : HISTORY PAGE
+// =====================================
+app.get(
+  '/member/search/history',
+  (req, res) => {
+
+    const lineUser =
+      req.session.lineUser;
+
+
+    // ยังไม่ได้ Login LINE
+    if (!lineUser?.userId) {
+
+      return res.redirect(
+        '/line/login?next=%2Fmember%2Fsearch%2Fhistory'
+      );
+
+    }
+
+
+    return res.sendFile(
+      path.join(
+        __dirname,
+        'private_pages',
+        'member-search-history.html'
+      )
+    );
+
+  }
+);
+
+
+// =====================================
+// MEMBER SEARCH : HISTORY DATA
+// แสดงเฉพาะประวัติของสมาชิกที่ Login อยู่
+// =====================================
+app.get(
+  '/member/search/history/data',
+  (req, res) => {
+
+    const lineUser =
+      req.session.lineUser;
+
+
+    if (!lineUser?.userId) {
+
+      return res
+        .status(401)
+        .json({
+          ok: false,
+          loginUrl:
+            '/line/login?next=%2Fmember%2Fsearch%2Fhistory'
+        });
+
+    }
+
+
+    let logs = [];
+
+
+    try {
+
+      logs =
+        JSON.parse(
+          fs.readFileSync(
+            SEARCH_LOG_FILE,
+            'utf8'
+          )
+        );
+
+    } catch {
+
+      logs = [];
+
+    }
+
+
+    // =====================================
+    // สำคัญ: เห็นเฉพาะ Log ของตัวเอง
+    // =====================================
+    const myLogs =
+  logs
+    .filter(log =>
+      String(
+        log?.userId || ''
+      ) ===
+      String(
+        lineUser.userId
+      )
+    )
+    .map((log, index) => ({
+
+      id:
+        index + 1,
+
+      text:
+        String(
+          log?.text || '-'
+        ),
+
+      source:
+        log?.source === 'web'
+          ? 'web'
+          : 'line',
+
+      time:
+        log?.time || null,
+
+      details:
+        Array.isArray(
+          log?.details
+        )
+          ? log.details
+          : []
+
+    }));
+
+    return res.json({
+      ok: true,
+      count:
+        myLogs.length,
+      logs:
+        myLogs
+    });
+
+  }
+);
+
+// =====================================
+// MEMBER SEARCH : SI
+// =====================================
+app.post(
+  '/member/search/si',
+  express.json(),
+  async (req, res) => {
+
+    try {
+
+      const lineUser =
+        req.session.lineUser;
+
+
+      // ==============================
+      // ต้อง Login LINE ก่อน
+      // ==============================
+      if (!lineUser?.userId) {
+
+        return res
+          .status(401)
+          .json({
+            ok: false,
+            message:
+              'กรุณาเข้าสู่ระบบผ่าน LINE'
+          });
+      }
+
+
+      const db =
+        loadDB();
+
+      db.members =
+        db.members || {};
+
+      db.siBlocked =
+        db.siBlocked || {};
+
+
+      const member =
+        db.members[
+          lineUser.userId
+        ];
+
+
+      // ==============================
+      // ต้องเป็นสมาชิก
+      // ==============================
+      if (!member) {
+
+        return res
+          .status(403)
+          .json({
+            ok: false,
+            message:
+              'ไม่พบข้อมูลสมาชิก'
+          });
+      }
+
+
+      // ==============================
+      // ต้องอนุมัติแล้ว
+      // ==============================
+      if (
+        member.status !==
+        'approved'
+      ) {
+
+        return res
+          .status(403)
+          .json({
+            ok: false,
+            message:
+              'บัญชีสมาชิกยังไม่พร้อมใช้งาน'
+          });
+      }
+
+
+      // ==============================
+      // ตรวจวันหมดอายุ
+      // ==============================
+      if (member.expireAt) {
+
+        const expireDate =
+          new Date(
+            member.expireAt
+          );
+
+
+        if (
+          !Number.isNaN(
+            expireDate.getTime()
+          ) &&
+          expireDate.getTime() <
+            Date.now()
+        ) {
+
+          return res
+            .status(403)
+            .json({
+              ok: false,
+              message:
+                'สิทธิ์สมาชิกหมดอายุแล้ว'
+            });
+        }
+      }
+
+
+      const phone =
+        String(
+          member.phone ||
+          member.tel ||
+          member.mobile ||
+          ''
+        )
+          .replace(/\D/g, '');
+
+
+      // ==============================
+      // ตรวจระงับ SI
+      // ==============================
+      if (
+        db.siBlocked?.[
+          phone
+        ] === true
+      ) {
+
+        return res.json({
+          ok: false,
+          blocked: true,
+          message:
+`ระบบทำการปรับปรุง⚠️
+ขออภัยในความไม่สะดวก🙏`
+        });
+      }
+
+
+      // ==============================
+      // ตรวจ Input
+      // ==============================
+      const citizenId =
+        String(
+          req.body?.citizenId ||
+          ''
+        )
+          .replace(/\D/g, '');
+
+
+      if (
+        !/^\d{13}$/.test(
+          citizenId
+        )
+      ) {
+
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            message:
+              'กรุณาระบุเลขบัตรประชาชน 13 หลัก'
+          });
+      }
+
+
+      // =====================================
+      // จุดเชื่อมระบบ SI ที่ได้รับอนุญาต
+      // =====================================
+      //
+      // ให้ฟังก์ชันภายในของคุณคืนค่าในรูป:
+      //
+      // [
+      //   {
+      //     companyName: 'บริษัท...',
+      //     branchCode: '0001',
+      //     accountNo: '...',
+      //     startDate: '...',
+      //     resignDate: '...',
+      //     status: '...'
+      //   }
+      // ]
+      //
+      // ตอนนี้ยังไม่ยิงแหล่งข้อมูลภายนอก
+      // =====================================
+
+      const siResponse =
+  await queryAuthorizedSiData({
+    citizenId,
+    requesterUserId:
+      lineUser.userId,
+    requesterPhone:
+      phone
+  });
+
+
+if (!siResponse?.success) {
+
+  return res
+    .status(502)
+    .json({
+      ok: false,
+      message:
+        siResponse?.message ||
+        'ไม่สามารถดึงข้อมูลประกันสังคมได้'
+    });
+}
+
+
+const content =
+  Array.isArray(
+    siResponse?.data?.content
+  )
+    ? siResponse.data.content
+    : [];
+
+
+const results =
+  content.map(item => ({
+
+    companyName:
+      item.companyName ||
+      '-',
+
+    branchCode:
+      item.accBran ||
+      item.branchCode ||
+      '-',
+
+    accountNo:
+      item.accNo ||
+      item.accountNo ||
+      '-',
+
+    startDate:
+      item.expStartDateText ||
+      '-',
+
+    resignDate:
+      item.empResignDateText ||
+      '-',
+
+    status:
+      item.employStatusDesc ||
+      '-'
+
+  }));
+
+
+      // Log เฉพาะท้าย 4 หลัก
+      console.log(
+        'WEB SI SEARCH:',
+        {
+          userId:
+            lineUser.userId,
+
+          phone,
+
+          citizenIdMasked:
+            '*********' +
+            citizenId.slice(-4)
+        }
+      );
+
+// =====================================
+// บันทึกประวัติการค้นหาจาก WEB
+// =====================================
+saveSearchLog(
+  lineUser.userId,
+
+  lineUser.displayName ||
+  member.lineName ||
+  member.displayName ||
+  '-',
+
+  `si%${citizenId}`,
+
+  'web',
+
+  results.map(item => ({
+
+    branchCode:
+      item.branchCode ||
+      '-',
+
+    startDate:
+      item.startDate ||
+      '-',
+
+    resignDate:
+      item.resignDate ||
+      '-',
+
+    status:
+      item.status ||
+      '-'
+
+  }))
+);
+
+      return res.json({
+        ok: true,
+        count:
+          results.length,
+        results
+      });
+
+
+    } catch (err) {
+
+  console.error(
+    'WEB SI SEARCH ERROR:',
+    {
+      message:
+        err?.message,
+
+      status:
+        err?.response?.status,
+
+      response:
+        err?.response?.data,
+
+      code:
+        err?.code
+    }
+  );
+
+
+  return res
+    .status(500)
+    .json({
+      ok: false,
+
+      message:
+        err?.response?.data?.message ||
+        err?.message ||
+        'ระบบค้นหาขัดข้อง กรุณาลองใหม่อีกครั้ง'
+    });
+}
+  }
+);
+
+// ==============================
+// MEMBER STATUS PAGE
+// ==============================
+app.get('/member/status', (req, res) => {
+  const lineUser = req.session.lineUser;
+
+  // ยังไม่ได้ Login LINE
+  if (!lineUser?.userId) {
+    return res.redirect(
+      '/line/login?next=%2Fmember%2Fstatus'
+    );
+  }
+
+  // โหลดฐานข้อมูลสมาชิก
+  const db = loadDB();
+
+  db.members = db.members || {};
+
+  const member = db.members[lineUser.userId];
+
+  // ป้องกัน HTML Injection
+  const escapeHtml = (value = '') =>
+    String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+  // ==============================
+  // ไม่พบสมาชิก
+  // ==============================
+  if (!member) {
+    return res.send(`
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>สถานะสมาชิก</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #070b11;
+  color: #ffffff;
+  font-family: Arial, Tahoma, sans-serif;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.card {
+  width: 100%;
+  max-width: 500px;
+  background: #10161f;
+  border: 1px solid #293747;
+  border-radius: 20px;
+  padding: 35px 25px;
+  text-align: center;
+}
+
+.icon {
+  font-size: 48px;
+  margin-bottom: 15px;
+}
+
+.text {
+  color: #94a3b8;
+  line-height: 1.7;
+}
+
+.btn {
+  display: block;
+  margin-top: 22px;
+  padding: 14px;
+  background: #d7b56d;
+  color: #111111;
+  text-decoration: none;
+  border-radius: 10px;
+  font-weight: bold;
+}
+</style>
+</head>
+
+<body>
+
+<div class="card">
+
+  <div class="icon">👤</div>
+
+  <h2>ไม่พบข้อมูลสมาชิก</h2>
+
+  <div class="text">
+    บัญชี LINE นี้ยังไม่ได้ลงทะเบียนสมาชิก
+  </div>
+
+  <a class="btn" href="/register">
+    สมัครสมาชิก
+  </a>
+
+</div>
+
+</body>
+</html>
+    `);
+  }
+
+  // ==============================
+  // ตรวจสอบวันหมดอายุ
+  // ==============================
+  const now = new Date();
+
+  const expireDate =
+    member.expireAt
+      ? new Date(member.expireAt)
+      : null;
+
+  const hasExpireDate =
+    expireDate &&
+    !Number.isNaN(expireDate.getTime());
+
+  let daysLeft = null;
+
+  if (hasExpireDate) {
+    const diff =
+      expireDate.getTime() - now.getTime();
+
+    daysLeft = Math.max(
+      0,
+      Math.ceil(
+        diff / (1000 * 60 * 60 * 24)
+      )
+    );
+  }
+
+  // ==============================
+  // สถานะสมาชิก
+  // ==============================
+  const memberStatus =
+    String(member.status || '')
+      .trim()
+      .toLowerCase();
+
+  const expired =
+    memberStatus === 'approved' &&
+    hasExpireDate &&
+    expireDate.getTime() <= now.getTime();
+
+  let statusText = 'รอการตรวจสอบ';
+  let statusClass = 'pending';
+  let statusIcon = '🟡';
+
+  if (memberStatus === 'approved') {
+    if (expired) {
+      statusText = 'หมดอายุ';
+      statusClass = 'expired';
+      statusIcon = '🔴';
+    } else {
+      statusText = 'ใช้งานได้';
+      statusClass = 'active';
+      statusIcon = '✅';
+    }
+  } else if (memberStatus === 'pending') {
+    statusText = 'รอการอนุมัติ';
+    statusClass = 'pending';
+    statusIcon = '🟡';
+  } else if (memberStatus === 'rejected') {
+    statusText = 'ไม่ผ่านการอนุมัติ';
+    statusClass = 'expired';
+    statusIcon = '❌';
+  }
+
+  const canUseSystem =
+    memberStatus === 'approved' &&
+    !expired;
+    
+// ==============================
+// เบอร์สมาชิกสำหรับตรวจสิทธิ์พิเศษ
+// ==============================
+const phone =
+  String(member.phone || '')
+    .replace(/\D/g, '');
+
+
+// ==============================
+// สิทธิ์พิเศษ
+// เฉพาะ 3 คำสั่งนี้ต้องแอดมินเปิดเพิ่ม
+// ==============================
+const specialPermissions = {
+
+  'a#':
+    db.aisPermissions?.[phone] === true,
+
+  'fx#':
+    db.fxPermissions?.[phone] === true,
+
+  // h# เดี๋ยวใส่ permission map จริงของคุณ
+  'h#':
+    false
+};
+
+
+// ==============================
+// รายการคำสั่งทั้งหมด
+// ==============================
+const searchSections = [
+
+  {
+    title: '📶 จดทะเบียนเบอร์โทร',
+
+    items: [
+      {
+        command: 'a#',
+        text: '📗a#เบอร์โทร/เลขบัตร → จดทะเบียน AIS',
+        special: true
+      },
+      {
+        command: 'd#',
+        text: '📘d#เบอร์โทร/เลขบัตร → จดทะเบียน DTAC'
+      },
+      {
+        command: 't#',
+        text: '📙t#เบอร์โทร/เลขบัตร/ชื่อ สกุล → จดทะเบียน True'
+      },
+      {
+        command: 'tid#',
+        text: '📙tid#เลขบัตร → True Online / True Fiber'
+      },
+      {
+        command: 'tv#',
+        text: '📙tv#เลขกล่อง → จุดติดตั้ง'
+      }
+    ]
+  },
+
+
+  {
+    title: '📱 ข้อมูลเครือข่าย',
+
+    items: [
+      {
+        command: '%',
+        text: '%66xxxxxxxxx → เช็คปิด/เปิดเครื่อง'
+      },
+      {
+        info: true,
+        text: 'ตัวอย่าง: %66812345678'
+      },
+      {
+        command: '?',
+        text: '?เบอร์โทร → ตรวจเครือข่ายเบอร์'
+      }
+    ]
+  },
+
+
+  {
+    title: '📦 พัสดุและการจัดส่ง',
+
+    items: [
+      {
+        command: 'fx#',
+        text: 'fx#เบอร์โทร/ชื่อสกุล → พัสดุละเอียด',
+        special: true
+      },
+      {
+        command: 'f#',
+        text: 'f#เบอร์โทร → ตรวจพัสดุ'
+      },
+      {
+        command: 'tic%',
+        text: 'tic%เลขพัสดุ → ตรวจภาพรับพัสดุ'
+      }
+    ]
+  },
+
+
+  {
+    title: '🏦 Bank / Cell',
+
+    items: [
+      {
+        command: 'bn%',
+        text: 'bn%ชื่อธนาคาร/รหัสสาขา → ค้นหาข้อมูลธนาคาร'
+      },
+      {
+        command: 'atm%',
+        text: 'atm%รหัสตู้ → ตรวจสอบจุดติดตั้ง ATM'
+      },
+      {
+        command: 'b%',
+        text: 'b%mcc/mnc/lac/cid → ตรวจพิกัดเสา Base'
+      }
+    ]
+  },
+
+
+  {
+    title: '🏥 การรักษาและสถานพยาบาล',
+
+    items: [
+      {
+        command: 'h#',
+        text: 'h#เลขบัตร → ตรวจข้อมูลการรักษา',
+        special: true
+      },
+      {
+        command: 'nm%',
+        text: 'nm%รหัสหน่วยบริการ/ชื่อสถานพยาบาล → ค้นหาสถานพยาบาล'
+      },
+      {
+        command: 'dc%',
+        text: 'dc%ชื่อ สกุล → ตรวจแพทย์'
+      },
+      {
+        command: 'dr%',
+        text: 'dr%ชื่อ สกุล → ตรวจแพทย์/บุคลากรสาธารณสุข'
+      }
+    ]
+  },
+
+
+  {
+    title: '🏛️ ประกันสังคมและสวัสดิการ',
+
+    items: [
+      {
+        command: 'si%',
+        text: 'si%เลขบัตร → ตรวจประกันสังคม'
+      },
+      {
+        command: 'wf%',
+        text: 'wf%เลขบัตร → ตรวจเบี้ยยังชีพ'
+      },
+      {
+        command: 'kp%',
+        text: 'kp%เลขบัตร/เลขสมาชิก → ตรวจสมาชิก สก.ทบ.'
+      }
+    ]
+  },
+
+
+  {
+    title: '⚖️ กฎหมาย / คดี / หมายจับ',
+
+    items: [
+      { command: 'dl#', text: 'dl#เลขบัตร → ตรวจใบขับขี่' },
+      { command: 'pb%', text: 'pb%เลขบัตร → ตรวจคุมประพฤติ' },
+      { command: 'nb%', text: 'nb%เลขบัตร → ตรวจประวัติคดียาเสพติด' },
+      { command: 'psi#', text: 'psi#เลขบัตร → ตรวจผู้ต้องขัง' },
+      { command: 'ps#', text: 'ps#เลขบัตร → ตรวจผู้ต้องขังยังไม่พิพากษา' },
+      { command: 'c#', text: 'c#เลขบัตร → ตรวจหมายจับ CRIME' },
+      { command: 'doc#', text: 'doc#เลขบัตร → ตรวจหมายจับศาล' },
+      { command: 'lw%', text: 'lw%คำถาม → ค้นหาข้อกฎหมาย' }
+    ]
+  },
+
+
+  {
+    title: '🏢 บริษัท / ใบอนุญาต',
+
+    items: [
+      { command: 'dbd%', text: 'dbd%เลขนิติบุคคล → ตรวจข้อมูลจดทะเบียนนิติบุคคล' },
+      { command: 'lc%', text: 'lc%ชื่อ-สกุล,ชื่อบริษัท → ตรวจใบอนุญาตบริษัท' },
+      { command: 'for%', text: 'for%เลขนิติบุคคล → ตรวจทะเบียนพาณิชย์/นิติบุคคล' },
+      { command: 'tr%', text: 'tr%ชื่อผู้ประกอบการ → ตรวจผู้ประกอบการขนส่ง' },
+      { command: 'tisi%', text: 'tisi%เลข มอก. → ตรวจมาตรฐาน มอก.' }
+    ]
+  },
+
+
+  {
+    title: '🚘 ยานพาหนะ',
+
+    items: [
+      { command: 'cid#', text: 'cid#เลขบัตร → ตรวจรถจากเลขบัตร' },
+      { command: 'car#', text: 'car#จังหวัด หมวด ตัวเลข ประเภทรถ → ตรวจสอบจากทะเบียน' },
+      { info: true, text: 'ตัวอย่าง: car#กรุงเทพ 1กก 334 1' },
+      { command: 'pt%', text: 'pt% → อ่านป้ายทะเบียนและวิเคราะห์รถ' },
+      { info: true, text: 'หมายเหตุ: รอระบบแจ้งให้ส่งภาพ' },
+      { command: 'tro%', text: 'tro%หมวดอักษร หมวดตัวเลข จังหวัด → ตรวจสอบเข้า ตรอ.' },
+      { info: true, text: 'ตัวอย่าง: tro%1กก 334 กรุงเทพ' },
+      { command: 'bq%', text: 'bq%เบอร์โทร/เลขบัตร → ตรวจสอบศูนย์บริการรถ' }
+    ]
+  },
+
+
+  {
+    title: '👤 เปรียบเทียบใบหน้า',
+
+    items: [
+      { command: 'ff%', text: 'ff% → เปรียบเทียบใบหน้า' },
+      { info: true, text: 'หมายเหตุ: รอระบบแจ้งให้ส่งภาพ' }
+    ]
+  },
+
+
+  {
+    title: '⚡ ไฟฟ้านครหลวง',
+
+    items: [
+      { command: 'mea%', text: 'mea%ชื่อ สกุล → ตรวจสอบข้อมูลไฟฟ้า MEA' },
+      { command: 'kru%', text: 'kru%เลขมิเตอร์ → ตรวจสอบมิเตอร์' }
+    ]
+  },
+
+
+  {
+    title: '⚡ ไฟฟ้าภูมิภาค',
+
+    items: [
+      { command: 'peac%', text: 'peac%เลข CA → ค้นหาจาก CA' },
+      { command: 'pean%', text: 'pean%ชื่อ สกุล → ค้นหาชื่อ-สกุล' },
+      { command: 'peau%', text: 'peau%ที่อยู่ → ค้นหาที่อยู่' },
+      { command: 'peab%', text: 'peab%เลข CA เลขมิเตอร์ → ประวัติการใช้' }
+    ]
+  },
+
+
+  {
+    title: '🌐 ออนไลน์',
+
+    items: [
+      { command: 'phis%', text: 'phis%URL → เพิ่ม Phishing' },
+      { command: 'chphis%', text: 'chphis%ID → ตรวจผล Phishing' },
+      { command: 'picf%', text: 'picf%URL → ดึงภาพ Profile Facebook' },
+      { command: 'soc%', text: 'soc%Username/ชื่อโซเชียล → ค้นหาโซเชียล' },
+      { command: 'web%', text: 'web%ชื่อเว็บไซต์ → ตรวจเว็บไซต์' },
+      { command: 'loa%', text: 'loa%ชื่อแอป → ตรวจแอปเงินกู้' }
+    ]
+  },
+
+
+  {
+    title: '📡 ข้อมูลเครือข่ายและอุปกรณ์',
+
+    items: [
+      { command: 'ip%', text: 'ip%เลข IP → ตรวจสอบเครือข่าย IP' },
+      { command: 'imei%', text: 'imei%เลข IMEI → ตรวจสอบ IMEI' },
+      { command: 'imsi%', text: 'imsi%เลข IMSI → ตรวจสอบ IMSI' },
+      { command: 'icc%', text: 'icc%เลข ICCID → ตรวจสอบเลขซิม' }
+    ]
+  },
+
+
+  {
+    title: '🗺️ แผนที่ระยะทาง',
+
+    items: [
+      { command: 'dis%', text: 'dis%พิกัดต้นทาง/พิกัดปลายทาง → คำนวณระยะทาง' },
+      { command: 'map%', text: 'map%ละติจูด,ลองจิจูด → ตรวจสอบพิกัด MAP' }
+    ]
+  },
+
+
+  {
+    title: '📹 เครื่องมืออื่น ๆ',
+
+    items: [
+      { command: 'cj%', text: 'cj%เบอร์โทร เลขบัตร → ตรวจสอบสมาชิก CJ' },
+      { command: 'se%', text: 'se%รหัสสาขา 7-11 → ตรวจสอบสาขาเซเว่น' },
+      { command: 'sc%', text: 'sc%เลขบัตร → ตรวจสอบประวัติการผ่อนสินค้า' },
+      { command: 'cctv%', text: 'cctv%เวลากล้อง,เวลาจริง → เปรียบเทียบเวลากล้อง' }
+    ]
+  }
+
+];
+
+
+// ==============================
+// สร้าง HTML สิทธิ์คำสั่ง
+// ==============================
+const searchPermissionHtml =
+  searchSections
+    .flatMap(section => section.items)
+    .filter(item => !item.info)
+    .map(item => {
+
+      // =============================
+      // ตรวจสิทธิ์เดิม
+      // =============================
+      let allowed = false;
+
+      if (item.special) {
+
+        allowed =
+          canUseSystem &&
+          specialPermissions[item.command] === true;
+
+      } else {
+
+        allowed = canUseSystem;
+
+      }
+
+
+      // =============================
+      // เอาเฉพาะชื่อรายการ
+      // ไม่แสดง command เช่น a#, d#, si%
+      // =============================
+      const rawText =
+        String(item.text || '').trim();
+
+      const arrowParts =
+        rawText.split('→');
+
+      const description =
+        arrowParts.length > 1
+          ? arrowParts
+              .slice(1)
+              .join('→')
+              .trim()
+          : rawText;
+
+
+      // =============================
+      // เก็บ emoji ด้านหน้าไว้
+      // เช่น 📗 📘 📙
+      // =============================
+      const emojiMatch =
+        rawText.match(
+          /[\p{Extended_Pictographic}]\uFE0F?/u
+        );
+
+      const icon =
+        emojiMatch
+          ? emojiMatch[0] + ' '
+          : '';
+
+
+      const displayText =
+        icon + description;
+
+
+      // =============================
+      // สถานะสิทธิ์
+      // =============================
+      const permissionText =
+        allowed
+          ? '✅ ใช้งานได้'
+          : '🔒 ยังไม่มีสิทธิ์';
+
+
+      return `
+        <div
+          class="search-command"
+          style="
+            display:block;
+            padding:14px 0;
+          "
+        >
+
+          <div
+            class="search-text"
+            style="
+              font-size:15px;
+              line-height:1.6;
+              color:#CBD5E1;
+            "
+          >
+            ${escapeHtml(displayText)}
+          </div>
+
+          <div
+            class="search-allowed"
+            style="
+              margin-top:5px;
+              font-size:13px;
+              font-weight:600;
+            "
+          >
+            ${permissionText}
+          </div>
+
+        </div>
+      `;
+
+    })
+    .join('');
+
+  // ==============================
+  // ชื่อสมาชิก
+  // ==============================
+  const memberName =
+    [
+      member.rank,
+      member.fullname || member.fullName
+    ]
+      .filter(Boolean)
+      .join(' ') ||
+    lineUser.displayName ||
+    '-';
+
+  // ==============================
+  // รูป LINE
+  // ==============================
+  const pictureUrl =
+    lineUser.pictureUrl
+      ? escapeHtml(lineUser.pictureUrl)
+      : '';
+
+  // ==============================
+  // วันหมดอายุแบบไทย
+  // ==============================
+  const expireText =
+    hasExpireDate
+      ? expireDate.toLocaleDateString(
+          'th-TH',
+          {
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric'
+          }
+        )
+      : '-';
+
+  return res.send(`
+<!DOCTYPE html>
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>สถานะสมาชิก</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #070b11;
+  color: #e5e7eb;
+  font-family: Arial, Tahoma, sans-serif;
+}
+
+.page {
+  padding: 20px;
+}
+
+.container {
+  width: 100%;
+  max-width: 620px;
+  margin: 20px auto;
+  background: #10161f;
+  border: 1px solid #293747;
+  border-radius: 22px;
+  padding: 24px;
+}
+
+.title {
+  color: #ffffff;
+  font-size: 19px;
+  font-weight: bold;
+  margin-bottom: 18px;
+}
+
+.profile {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  padding: 17px;
+  background: #080d13;
+  border: 1px solid #293747;
+  border-radius: 15px;
+}
+
+.avatar {
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #1e293b;
+}
+
+.profile-label {
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.profile-name {
+  margin-top: 4px;
+  color: #ffffff;
+  font-size: 17px;
+  font-weight: bold;
+}
+
+.uid {
+  margin-top: 5px;
+  color: #64748b;
+  font-size: 10px;
+  word-break: break-all;
+}
+
+.divider {
+  margin: 24px 0;
+  border: 0;
+  border-top: 1px solid #293441;
+}
+
+.section-title {
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: bold;
+  margin-bottom: 14px;
+}
+
+.status-box {
+  padding: 18px;
+  background: #080d13;
+  border: 1px solid #293747;
+  border-radius: 15px;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 15px;
+  padding: 10px 0;
+}
+
+.label {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.value {
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: bold;
+  text-align: right;
+}
+
+.active {
+  color: #86efac;
+}
+
+.pending {
+  color: #facc15;
+}
+
+.expired {
+  color: #f87171;
+}
+
+.days {
+  color: #d7b56d;
+  font-size: 26px;
+  font-weight: bold;
+}
+
+.ok {
+  color: #86efac;
+}
+
+.no {
+  color: #f87171;
+}
+
+.note {
+  margin-top: 20px;
+  color: #64748b;
+  text-align: center;
+  font-size: 11px;
+}
+
+.search-header {
+  margin-top: 5px;
+  margin-bottom: 22px;
+  color: #ffffff;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+.search-section {
+  margin-bottom: 28px;
+}
+
+.search-title {
+  margin-bottom: 12px;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: bold;
+}
+
+.search-command {
+  padding: 12px 0;
+  border-bottom: 1px solid #1f2937;
+}
+
+.search-text {
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.search-allowed {
+  margin-top: 5px;
+  margin-left: 18px;
+  color: #86efac;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.search-locked {
+  margin-top: 5px;
+  margin-left: 18px;
+  color: #fbbf24;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.search-info {
+  padding: 7px 0 7px 18px;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="page">
+
+<div class="container">
+
+  <div class="title">
+    👤 สถานะสมาชิก
+  </div>
+
+  <div class="profile">
+
+    ${
+      pictureUrl
+        ? `
+          <img
+            class="avatar"
+            src="${pictureUrl}"
+            alt="LINE Profile"
+          >
+        `
+        : `
+          <div class="avatar"></div>
+        `
+    }
+
+    <div>
+
+      <div class="profile-label">
+        บัญชี LINE
+      </div>
+
+      <div class="profile-name">
+        ${escapeHtml(
+          member.lineName ||
+          lineUser.displayName ||
+          '-'
+        )}
+      </div>
+
+      <div class="uid">
+        UID : ${escapeHtml(lineUser.userId)}
+      </div>
+
+    </div>
+
+  </div>
+
+  <hr class="divider">
+
+  <div class="section-title">
+    📅 สถานะการใช้งาน
+  </div>
+
+  <div class="status-box">
+
+    <div class="row">
+      <div class="label">สถานะ</div>
+
+      <div class="value ${statusClass}">
+        ${statusIcon} ${statusText}
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label">ชื่อสมาชิก</div>
+
+      <div class="value">
+        ${escapeHtml(memberName)}
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label">หมายเลขโทรศัพท์</div>
+
+      <div class="value">
+        ${escapeHtml(member.phone || '-')}
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label">วันที่อนุมัติ</div>
+
+      <div class="value">
+        ${escapeHtml(member.approvedAt || '-')}
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label">ระยะเวลาที่ได้รับ</div>
+
+      <div class="value">
+        ${
+          member.approvedDays
+            ? `${Number(member.approvedDays)} วัน`
+            : '-'
+        }
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label">วันหมดอายุ</div>
+
+      <div class="value">
+        ${escapeHtml(expireText)}
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label">วันใช้งานคงเหลือ</div>
+
+      <div class="days">
+        ${
+          memberStatus !== 'approved'
+            ? '-'
+            : `${daysLeft ?? 0} วัน`
+        }
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label">สิทธิ์ใช้งานระบบ</div>
+
+      <div class="value ${
+        canUseSystem ? 'ok' : 'no'
+      }">
+
+        ${
+          canUseSystem
+            ? '✅ ใช้งานได้'
+            : '❌ ไม่สามารถใช้งานได้'
+        }
+
+      </div>
+    </div>
+
+  </div>
+
+<hr class="divider">
+
+<div class="search-header">
+  🔎 สิทธิสืบค้นข้อมูล
+</div>
+
+${searchPermissionHtml}
+
+  <div class="note">
+    ข้อมูลสถานะอ้างอิงจากสิทธิ์สมาชิกในระบบ
+  </div>
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+  `);
+});
+
+// =====================================
+// SIGNAL REQUEST PAGE
+// =====================================
+app.get('/signal/request', (req, res) => {
+
+  const lineUser = req.session.lineUser;
+
+  // =====================================
+  // ยังไม่ได้ Login LINE
+  // =====================================
+  if (!lineUser?.userId) {
+    return res.redirect(
+      '/line/login?next=%2Fsignal%2Frequest'
+    );
+  }
+
+
+  // =====================================
+  // โหลดฐานข้อมูล
+  // =====================================
+  const db = loadDB();
+
+  db.members =
+    db.members || {};
+
+  db.remoteSignalPermissions =
+    db.remoteSignalPermissions || {};
+
+
+  const member =
+    db.members[lineUser.userId];
+
+
+  // =====================================
+  // ป้องกัน HTML Injection
+  // =====================================
+  const escapeHtml = (value = '') =>
+    String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+
+  // =====================================
+  // ตรวจสถานะสมาชิก
+  // =====================================
+  const memberStatus =
+    String(member?.status || '')
+      .trim()
+      .toLowerCase();
+
+
+  const expireDate =
+    member?.expireAt
+      ? new Date(member.expireAt)
+      : null;
+
+
+  const hasExpireDate =
+    expireDate &&
+    !Number.isNaN(
+      expireDate.getTime()
+    );
+
+
+  const expired =
+    hasExpireDate &&
+    expireDate.getTime() <= Date.now();
+
+
+  const memberActive =
+    memberStatus === 'approved' &&
+    !expired;
+
+
+  // =====================================
+  // ตรวจสิทธิ์ระบบขอข้อมูลสัญญาณ
+  // =====================================
+  const remoteAllowed =
+    memberActive &&
+    db.remoteSignalPermissions?.[
+      lineUser.userId
+    ] === true;
+
+
+  // =====================================
+  // สร้าง CSRF Token สำหรับแบบฟอร์ม
+  // =====================================
+  const csrfToken =
+    crypto
+      .randomBytes(24)
+      .toString('hex');
+
+  req.session.signalCsrf =
+    csrfToken;
+
+
+  // =====================================
+  // ข้อมูลสมาชิก
+  // =====================================
+  const lineName =
+    escapeHtml(
+      member?.lineName ||
+      member?.displayName ||
+      lineUser.displayName ||
+      '-'
+    );
+
+
+  const uid =
+    escapeHtml(
+      lineUser.userId
+    );
+
+
+  const memberPhone =
+    escapeHtml(
+      member?.phone || '-'
+    );
+
+
+  const pictureUrl =
+    lineUser.pictureUrl
+      ? escapeHtml(
+          lineUser.pictureUrl
+        )
+      : '';
+
+
+  // =====================================
+  // ส่งหน้าเว็บ
+  // =====================================
+  return res.send(`
+<!DOCTYPE html>
+
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+  ระบบขอข้อมูลสัญญาณระยะไกล
+</title>
+
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+
+body {
+
+  margin: 0;
+
+  min-height: 100vh;
+
+  background: #070b11;
+
+  color: #e5e7eb;
+
+  font-family:
+    Arial,
+    Tahoma,
+    sans-serif;
+
+  padding: 18px;
+
+}
+
+
+.container {
+
+  width: 100%;
+
+  max-width: 620px;
+
+  margin:
+    15px auto
+    50px;
+
+  background: #10161f;
+
+  border:
+    1px solid
+    #293747;
+
+  border-radius: 22px;
+
+  padding: 24px;
+
+}
+
+
+.top-title {
+
+  color: #ffffff;
+
+  font-size: 20px;
+
+  font-weight: bold;
+
+  line-height: 1.4;
+
+}
+
+
+.top-description {
+
+  margin-top: 7px;
+
+  color: #94a3b8;
+
+  font-size: 12px;
+
+  line-height: 1.7;
+
+}
+
+
+/* ==============================
+   PROFILE
+============================== */
+
+.profile-title {
+
+  margin-top: 25px;
+
+  margin-bottom: 11px;
+
+  color: #ffffff;
+
+  font-size: 15px;
+
+  font-weight: bold;
+
+}
+
+
+.profile-card {
+
+  display: flex;
+
+  align-items: center;
+
+  gap: 15px;
+
+  padding: 17px;
+
+  background: #080d13;
+
+  border:
+    1px solid
+    #293747;
+
+  border-radius: 15px;
+
+}
+
+
+.avatar {
+
+  width: 70px;
+
+  height: 70px;
+
+  flex-shrink: 0;
+
+  border-radius: 50%;
+
+  object-fit: cover;
+
+  background: #1e293b;
+
+  border:
+    2px solid
+    #334155;
+
+}
+
+
+.avatar-empty {
+
+  width: 70px;
+
+  height: 70px;
+
+  flex-shrink: 0;
+
+  border-radius: 50%;
+
+  display: flex;
+
+  align-items: center;
+
+  justify-content: center;
+
+  background: #1e293b;
+
+  border:
+    2px solid
+    #334155;
+
+  font-size: 30px;
+
+}
+
+
+.profile-label {
+
+  color: #64748b;
+
+  font-size: 10px;
+
+}
+
+
+.profile-name {
+
+  margin-top: 3px;
+
+  margin-bottom: 7px;
+
+  color: #ffffff;
+
+  font-size: 17px;
+
+  font-weight: bold;
+
+}
+
+
+.profile-line {
+
+  margin-top: 4px;
+
+  color: #94a3b8;
+
+  font-size: 11px;
+
+  line-height: 1.5;
+
+  word-break: break-all;
+
+}
+
+
+/* ==============================
+   STATUS
+============================== */
+
+.status-area {
+
+  margin-top: 13px;
+
+  display: grid;
+
+  gap: 9px;
+
+}
+
+
+.status-box {
+
+  padding: 12px 14px;
+
+  border-radius: 11px;
+
+  font-size: 12px;
+
+  font-weight: bold;
+
+  line-height: 1.5;
+
+}
+
+
+.status-ok {
+
+  color: #86efac;
+
+  background: #092416;
+
+  border:
+    1px solid
+    #245b38;
+
+}
+
+
+.status-lock {
+
+  color: #fca5a5;
+
+  background: #25130d;
+
+  border:
+    1px solid
+    #6b3424;
+
+}
+
+
+/* ==============================
+   DIVIDER
+============================== */
+
+.divider {
+
+  border: 0;
+
+  border-top:
+    1px solid
+    #293747;
+
+  margin: 26px 0;
+
+}
+
+
+/* ==============================
+   FORM
+============================== */
+
+.section-title {
+
+  color: #ffffff;
+
+  font-size: 17px;
+
+  font-weight: bold;
+
+  line-height: 1.5;
+
+}
+
+
+.section-description {
+
+  margin-top: 6px;
+
+  margin-bottom: 23px;
+
+  color: #94a3b8;
+
+  font-size: 12px;
+
+  line-height: 1.8;
+
+}
+
+
+.field {
+
+  margin-bottom: 19px;
+
+}
+
+
+.field-label {
+
+  display: block;
+
+  margin-bottom: 7px;
+
+  color: #dbeafe;
+
+  font-size: 12px;
+
+  font-weight: bold;
+
+}
+
+
+.required {
+
+  color: #f87171;
+
+}
+
+
+.field-help {
+
+  margin-bottom: 8px;
+
+  color: #64748b;
+
+  font-size: 11px;
+
+  line-height: 1.6;
+
+}
+
+
+input[type="text"],
+input[type="tel"],
+select {
+
+  width: 100%;
+
+  height: 49px;
+
+  padding:
+    0 14px;
+
+  background: #080d13;
+
+  color: #ffffff;
+
+  border:
+    1px solid
+    #354355;
+
+  border-radius: 10px;
+
+  font-size: 14px;
+
+  outline: none;
+
+}
+
+
+input:focus,
+select:focus {
+
+  border-color: #d7b56d;
+
+}
+
+
+select option {
+
+  background: #10161f;
+
+  color: #ffffff;
+
+}
+
+
+/* ==============================
+   UPLOAD
+============================== */
+
+.upload-box {
+
+  display: block;
+
+  padding: 24px 18px;
+
+  background: #080d13;
+
+  border:
+    1px dashed
+    #52657c;
+
+  border-radius: 13px;
+
+  text-align: center;
+
+  cursor: pointer;
+
+}
+
+
+.upload-box:hover {
+
+  border-color: #d7b56d;
+
+}
+
+
+.upload-box input {
+
+  display: none;
+
+}
+
+
+.upload-icon {
+
+  font-size: 27px;
+
+  margin-bottom: 7px;
+
+}
+
+
+.upload-title {
+
+  color: #e5e7eb;
+
+  font-size: 13px;
+
+  font-weight: bold;
+
+}
+
+
+.upload-help {
+
+  margin-top: 6px;
+
+  color: #64748b;
+
+  font-size: 11px;
+
+  line-height: 1.6;
+
+}
+
+
+.file-name {
+
+  margin-top: 10px;
+
+  color: #d7b56d;
+
+  font-size: 11px;
+
+  line-height: 1.5;
+
+  word-break: break-all;
+
+}
+
+
+/* ==============================
+   POLICY
+============================== */
+
+.warning-box {
+
+  margin-top: 25px;
+
+  padding: 17px;
+
+  background: #17130a;
+
+  border:
+    1px solid
+    #55451c;
+
+  border-radius: 13px;
+
+}
+
+
+.warning-title {
+
+  margin-bottom: 9px;
+
+  color: #f8d878;
+
+  font-size: 13px;
+
+  font-weight: bold;
+
+}
+
+
+.warning-text {
+
+  color: #d8c99d;
+
+  font-size: 11px;
+
+  line-height: 1.9;
+
+}
+
+
+.consent {
+
+  display: flex;
+
+  align-items: flex-start;
+
+  gap: 10px;
+
+  margin-top: 16px;
+
+  color: #e2e8f0;
+
+  font-size: 11px;
+
+  line-height: 1.7;
+
+  cursor: pointer;
+
+}
+
+
+.consent input {
+
+  width: 18px;
+
+  height: 18px;
+
+  flex-shrink: 0;
+
+  margin-top: 2px;
+
+  accent-color: #d7b56d;
+
+}
+
+
+/* ==============================
+   BUTTON
+============================== */
+
+.submit-btn {
+
+  width: 100%;
+
+  height: 53px;
+
+  margin-top: 23px;
+
+  background: #d7b56d;
+
+  color: #111111;
+
+  border: 0;
+
+  border-radius: 11px;
+
+  font-size: 15px;
+
+  font-weight: bold;
+
+  cursor: pointer;
+
+}
+
+
+.submit-btn:hover {
+
+  opacity: .94;
+
+}
+
+
+.submit-btn:disabled {
+
+  opacity: .45;
+
+  cursor: not-allowed;
+
+}
+
+
+/* ==============================
+   NO PERMISSION
+============================== */
+
+.no-permission {
+
+  padding: 18px;
+
+  color: #fca5a5;
+
+  background: #25130d;
+
+  border:
+    1px solid
+    #6b3424;
+
+  border-radius: 12px;
+
+  font-size: 12px;
+
+  line-height: 1.8;
+
+}
+
+
+.no-permission-title {
+
+  margin-bottom: 7px;
+
+  color: #fecaca;
+
+  font-size: 14px;
+
+  font-weight: bold;
+
+}
+
+
+.footer-note {
+
+  margin-top: 24px;
+
+  color: #475569;
+
+  text-align: center;
+
+  font-size: 10px;
+
+  line-height: 1.7;
+
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<div class="container">
+
+
+  <!-- ==========================
+       หัวข้อ
+  =========================== -->
+
+  <div class="top-title">
+
+    📡 ระบบขอข้อมูลสัญญาณระยะไกล
+
+  </div>
+
+
+  <div class="top-description">
+
+    สำหรับเจ้าหน้าที่ที่ได้รับอนุญาต
+    ให้เข้าถึงและใช้งานตามหน้าที่เท่านั้น
+
+  </div>
+
+
+
+  <!-- ==========================
+       ข้อมูลผู้ใช้งาน
+  =========================== -->
+
+  <div class="profile-title">
+
+    👤 ข้อมูลผู้ใช้งาน
+
+  </div>
+
+
+  <div class="profile-card">
+
+
+    ${
+      pictureUrl
+        ? `
+
+    <img
+      class="avatar"
+      src="${pictureUrl}"
+      alt="LINE Profile"
+    >
+
+          `
+        : `
+
+    <div class="avatar-empty">
+      👤
+    </div>
+
+          `
+    }
+
+
+    <div>
+
+
+      <div class="profile-label">
+
+        ชื่อ LINE
+
+      </div>
+
+
+      <div class="profile-name">
+
+        ${lineName}
+
+      </div>
+
+
+      <div class="profile-line">
+
+        UID : ${uid}
+
+      </div>
+
+
+      <div class="profile-line">
+
+        เบอร์สมาชิก : ${memberPhone}
+
+      </div>
+
+
+    </div>
+
+
+  </div>
+
+
+
+  <!-- ==========================
+       สถานะ
+  =========================== -->
+
+  <div class="status-area">
+
+
+    <div class="
+      status-box
+      ${
+        memberActive
+          ? 'status-ok'
+          : 'status-lock'
+      }
+    ">
+
+
+      ${
+        memberActive
+          ? '✅ สถานะสมาชิก : ใช้งานได้'
+          : '🔒 สถานะสมาชิก : ไม่สามารถใช้งานได้'
+      }
+
+
+    </div>
+
+
+
+    <div class="
+      status-box
+      ${
+        remoteAllowed
+          ? 'status-ok'
+          : 'status-lock'
+      }
+    ">
+
+
+      ${
+        remoteAllowed
+          ? '✅ สิทธิ์ขอข้อมูล : มีสิทธิ์ใช้งาน'
+          : '🔒 สิทธิ์ขอข้อมูล : ไม่มีสิทธิ์ใช้งาน'
+      }
+
+
+    </div>
+
+
+  </div>
+
+
+
+  <hr class="divider">
+
+
+
+  ${
+    remoteAllowed
+      ? `
+
+
+  <!-- ==========================
+       แบบฟอร์ม
+  =========================== -->
+
+
+  <div class="section-title">
+
+    📋 รายละเอียดคำขอ
+
+  </div>
+
+
+  <div class="section-description">
+
+    กรุณากรอกข้อมูลให้ครบถ้วน
+    และตรวจสอบความถูกต้องก่อนส่งคำขอ
+
+  </div>
+
+
+
+  <form
+    id="signalRequestForm"
+    method="POST"
+    action="/signal/request"
+    enctype="multipart/form-data"
+  >
+
+
+    <input
+      type="hidden"
+      name="csrf"
+      value="${csrfToken}"
+    >
+
+
+
+    <!-- หมายเลข -->
+
+
+    <div class="field">
+
+
+      <label class="field-label">
+
+        หมายเลขที่ต้องการตรวจสอบ
+        <span class="required">*</span>
+
+      </label>
+
+
+      <div class="field-help">
+
+        กรุณาระบุหมายเลขโทรศัพท์ 10 หลัก
+
+      </div>
+
+
+      <input
+        id="targetPhone"
+        type="tel"
+        name="targetPhone"
+        inputmode="numeric"
+        maxlength="10"
+        pattern="0[0-9]{9}"
+        autocomplete="off"
+        placeholder="เช่น 0812345678"
+        required
+      >
+
+
+    </div>
+
+
+
+    <!-- เครือข่าย -->
+
+
+    <div class="field">
+
+
+      <label class="field-label">
+
+        เครือข่าย
+        <span class="required">*</span>
+
+      </label>
+
+
+      <select
+        name="network"
+        required
+      >
+
+
+        <option value="">
+
+          -- เลือกเครือข่าย --
+
+        </option>
+
+
+        <option value="AIS">
+
+          AIS
+
+        </option>
+
+
+        <option value="TRUE">
+
+          TRUE
+
+        </option>
+
+
+        <option value="DTAC">
+
+          DTAC
+
+        </option>
+
+
+      </select>
+
+
+    </div>
+
+
+
+    <!-- เคส -->
+
+
+    <div class="field">
+
+
+      <label class="field-label">
+
+        ชื่อเคสคดี / เคสหมายจับ
+        <span class="required">*</span>
+
+      </label>
+
+
+      <div class="field-help">
+
+        ระบุชื่อคดี เลขคดี
+        หรือข้อมูลอ้างอิงที่เกี่ยวข้อง
+
+      </div>
+
+
+      <input
+        type="text"
+        name="caseName"
+        maxlength="250"
+        autocomplete="off"
+        placeholder="ระบุชื่อหรือเลขอ้างอิงคดี"
+        required
+      >
+
+
+    </div>
+
+
+
+    <!-- ประเภทข้อมูลเป้าหมาย -->
+
+
+    <div class="field">
+
+
+      <label class="field-label">
+
+        ประเภทข้อมูลเป้าหมาย
+        <span class="required">*</span>
+
+      </label>
+
+
+      <div class="field-help">
+
+        เลือกข้อมูลอย่างใดอย่างหนึ่ง
+
+      </div>
+
+
+      <select
+        id="targetType"
+        name="targetType"
+        required
+      >
+
+
+        <option value="">
+
+          -- เลือกประเภทข้อมูล --
+
+        </option>
+
+
+        <option value="name">
+
+          ชื่อ - นามสกุล
+
+        </option>
+
+
+        <option value="idcard">
+
+          เลขประจำตัว 13 หลัก
+
+        </option>
+
+
+        <option value="passport">
+
+          เลขหนังสือเดินทาง
+
+        </option>
+
+
+      </select>
+
+
+    </div>
+
+
+
+    <!-- ข้อมูลเป้าหมาย -->
+
+
+    <div class="field">
+
+
+      <label class="field-label">
+
+        ข้อมูลเป้าหมาย
+        <span class="required">*</span>
+
+      </label>
+
+
+      <div
+        id="targetHelp"
+        class="field-help"
+      >
+
+        ชื่อ - นามสกุล /
+        เลขประจำตัว 13 หลัก /
+        เลขหนังสือเดินทาง
+
+      </div>
+
+
+      <input
+        id="targetValue"
+        type="text"
+        name="targetValue"
+        maxlength="300"
+        autocomplete="off"
+        placeholder="กรอกข้อมูลเป้าหมาย"
+        required
+      >
+
+
+    </div>
+
+
+
+    <!-- เอกสาร -->
+
+
+    <div class="field">
+
+
+      <label class="field-label">
+
+        เอกสารประกอบ
+        <span class="required">*</span>
+
+      </label>
+
+
+      <div class="field-help">
+
+        กรณีคดี:
+        แนบเอกสาร ปจว.
+        หรือเอกสารที่เกี่ยวข้อง
+
+        <br>
+
+        กรณีหมายจับ:
+        แนบสำเนาหมายจับ
+
+      </div>
+
+
+      <label class="upload-box">
+
+
+        <input
+          id="evidence"
+          type="file"
+          name="evidence"
+          accept="image/jpeg,image/png"
+          required
+        >
+
+
+        <div class="upload-icon">
+
+          📎
+
+        </div>
+
+
+        <div class="upload-title">
+
+          เลือกรูปภาพเอกสาร
+
+        </div>
+
+
+        <div class="upload-help">
+
+          รองรับไฟล์ JPG / PNG
+          สูงสุด 8 MB
+
+        </div>
+
+
+        <div
+          id="fileName"
+          class="file-name"
+        >
+        </div>
+
+
+      </label>
+
+
+    </div>
+
+
+
+    <!-- ==========================
+         ข้อกำหนด
+    =========================== -->
+
+
+    <div class="warning-box">
+
+
+      <div class="warning-title">
+
+        ⚠️ ข้อกำหนดการใช้ข้อมูล
+
+      </div>
+
+
+      <div class="warning-text">
+
+        ข้อมูลที่ได้รับอนุญาตให้เข้าถึง
+        ให้ใช้เฉพาะเพื่อการปฏิบัติหน้าที่
+        ตามคำขอที่ได้รับอนุมัติเท่านั้น
+
+        <br><br>
+
+        ห้ามนำข้อมูลไปเผยแพร่สู่ภายนอก
+        ส่งต่อให้บุคคลที่ไม่เกี่ยวข้องกับหน้าที่
+        หรือนำไปใช้เพื่อประโยชน์ส่วนบุคคล
+
+        <br><br>
+
+        ห้ามนำข้อมูลไปแสวงหาผลประโยชน์
+        เชิงพาณิชย์กับบุคคลภายนอก
+
+        <br><br>
+
+        ระบบอาจบันทึกข้อมูลผู้ยื่นคำขอ
+        วันเวลา และรายละเอียดคำขอ
+        เพื่อใช้ในการตรวจสอบการใช้งาน
+
+      </div>
+
+
+
+      <label class="consent">
+
+
+        <input
+          id="dataAgreement"
+          type="checkbox"
+          name="dataAgreement"
+          value="yes"
+          required
+        >
+
+
+        <span>
+
+          ข้าพเจ้าได้อ่านและรับทราบ
+          ข้อกำหนดการใช้งานข้อมูล
+          และยืนยันว่าจะใช้ข้อมูล
+          เฉพาะเพื่อการปฏิบัติหน้าที่
+          ที่เกี่ยวข้องเท่านั้น
+
+        </span>
+
+
+      </label>
+
+
+    </div>
+
+
+
+    <!-- ปุ่มส่ง -->
+
+
+    <button
+      id="submitButton"
+      class="submit-btn"
+      type="submit"
+    >
+
+      📤 ส่งคำขอข้อมูล
+
+    </button>
+
+
+  </form>
+
+
+        `
+      : `
+
+
+  <!-- ==========================
+       ไม่มีสิทธิ์
+  =========================== -->
+
+
+  <div class="no-permission">
+
+
+    <div class="no-permission-title">
+
+      🔒 ยังไม่มีสิทธิ์ใช้งาน
+
+    </div>
+
+
+    บัญชีของท่านยังไม่ได้รับสิทธิ์
+    สำหรับระบบขอข้อมูลสัญญาณระยะไกล
+
+    <br><br>
+
+    ระบบจะเปิดแบบฟอร์มคำขอ
+    หลังจากผู้ดูแลระบบอนุญาตสิทธิ์แล้ว
+
+
+  </div>
+
+
+        `
+  }
+
+
+
+  <div class="footer-note">
+
+    การเข้าถึงและใช้งานระบบ
+    จะถูกตรวจสอบตามสิทธิ์ของสมาชิก
+
+  </div>
+
+
+</div>
+
+
+
+<script>
+
+
+// =====================================
+// แสดงชื่อไฟล์ที่เลือก
+// =====================================
+
+const evidence =
+  document.getElementById(
+    'evidence'
+  );
+
+
+const fileName =
+  document.getElementById(
+    'fileName'
+  );
+
+
+if (
+  evidence &&
+  fileName
+) {
+
+  evidence.addEventListener(
+    'change',
+    function () {
+
+      if (
+        this.files &&
+        this.files.length > 0
+      ) {
+
+        const file =
+          this.files[0];
+
+
+        fileName.textContent =
+          'ไฟล์ที่เลือก : ' +
+          file.name;
+
+
+      } else {
+
+        fileName.textContent =
+          '';
+
+      }
+
+    }
+  );
+
+}
+
+
+
+// =====================================
+// เปลี่ยน Placeholder ตามประเภทเป้าหมาย
+// =====================================
+
+const targetType =
+  document.getElementById(
+    'targetType'
+  );
+
+
+const targetValue =
+  document.getElementById(
+    'targetValue'
+  );
+
+
+const targetHelp =
+  document.getElementById(
+    'targetHelp'
+  );
+
+
+if (
+  targetType &&
+  targetValue
+) {
+
+  targetType.addEventListener(
+    'change',
+    function () {
+
+      const type =
+        this.value;
+
+
+      if (type === 'name') {
+
+        targetValue.placeholder =
+          'เช่น สมชาย ใจดี';
+
+        targetValue.inputMode =
+          'text';
+
+        targetValue.maxLength =
+          300;
+
+
+        if (targetHelp) {
+
+          targetHelp.textContent =
+            'ระบุชื่อ - นามสกุลของเป้าหมาย';
+
+        }
+
+
+      } else if (
+        type === 'idcard'
+      ) {
+
+        targetValue.placeholder =
+          'กรอกเลขประจำตัว 13 หลัก';
+
+        targetValue.inputMode =
+          'numeric';
+
+        targetValue.maxLength =
+          13;
+
+
+        if (targetHelp) {
+
+          targetHelp.textContent =
+            'ระบุเลขประจำตัว 13 หลัก';
+
+        }
+
+
+      } else if (
+        type === 'passport'
+      ) {
+
+        targetValue.placeholder =
+          'กรอกเลขหนังสือเดินทาง';
+
+        targetValue.inputMode =
+          'text';
+
+        targetValue.maxLength =
+          30;
+
+
+        if (targetHelp) {
+
+          targetHelp.textContent =
+            'ระบุเลขหนังสือเดินทางของเป้าหมาย';
+
+        }
+
+
+      } else {
+
+        targetValue.placeholder =
+          'กรอกข้อมูลเป้าหมาย';
+
+        targetValue.inputMode =
+          'text';
+
+        targetValue.maxLength =
+          300;
+
+      }
+
+    }
+  );
+
+}
+
+
+
+// =====================================
+// หมายเลขโทรศัพท์ให้รับเฉพาะตัวเลข
+// =====================================
+
+const targetPhone =
+  document.getElementById(
+    'targetPhone'
+  );
+
+
+if (targetPhone) {
+
+  targetPhone.addEventListener(
+    'input',
+    function () {
+
+      this.value =
+        this.value
+          .replace(/\\D/g, '')
+          .slice(0, 10);
+
+    }
+  );
+
+}
+
+
+
+// =====================================
+// เลขบัตรให้รับเฉพาะตัวเลข
+// =====================================
+
+if (targetValue) {
+
+  targetValue.addEventListener(
+    'input',
+    function () {
+
+      if (
+        targetType &&
+        targetType.value === 'idcard'
+      ) {
+
+        this.value =
+          this.value
+            .replace(/\\D/g, '')
+            .slice(0, 13);
+
+      }
+
+    }
+  );
+
+}
+
+
+
+// =====================================
+// ป้องกันกดส่งซ้ำ
+// =====================================
+
+const signalRequestForm =
+  document.getElementById(
+    'signalRequestForm'
+  );
+
+
+const submitButton =
+  document.getElementById(
+    'submitButton'
+  );
+
+
+if (
+  signalRequestForm &&
+  submitButton
+) {
+
+  signalRequestForm.addEventListener(
+    'submit',
+    function () {
+
+      submitButton.disabled =
+        true;
+
+      submitButton.textContent =
+        '⏳ กำลังส่งคำขอ...';
+
+    }
+  );
+
+}
+
+
+</script>
+
+
+</body>
+
+</html>
+  `);
+
+});
+
+// =====================================
+// SIGNAL REQUEST SUBMIT
+// =====================================
+app.post('/signal/request', (req, res) => {
+
+  signalRequestUpload.single('evidence')(
+    req,
+    res,
+    async (uploadErr) => {
+
+      // =====================================
+      // ฟังก์ชันลบไฟล์ที่เพิ่งอัปโหลด
+      // ใช้กรณี validation ไม่ผ่าน
+      // =====================================
+      const deleteUploadedFile = () => {
+
+        if (req.file?.path) {
+
+          fs.unlink(
+            req.file.path,
+            () => {}
+          );
+
+        }
+
+      };
+
+
+      try {
+
+        // =====================================
+        // MULTER ERROR
+        // =====================================
+        if (uploadErr) {
+
+          console.error(
+            'SIGNAL UPLOAD ERROR:',
+            uploadErr
+          );
+
+          return res.status(400).send(
+            '❌ ไม่สามารถอัปโหลดเอกสารได้: ' +
+            uploadErr.message
+          );
+
+        }
+
+
+        // =====================================
+        // ตรวจ LINE SESSION
+        // =====================================
+        const lineUser =
+          req.session.lineUser;
+
+
+        if (!lineUser?.userId) {
+
+          deleteUploadedFile();
+
+          return res.redirect(
+            '/line/login?next=%2Fsignal%2Frequest'
+          );
+
+        }
+
+
+        // =====================================
+        // ตรวจ CSRF TOKEN
+        // =====================================
+        const csrf =
+          String(
+            req.body.csrf || ''
+          );
+
+
+        const sessionCsrf =
+          String(
+            req.session.signalCsrf || ''
+          );
+
+
+        if (
+          !csrf ||
+          !sessionCsrf ||
+          csrf !== sessionCsrf
+        ) {
+
+          deleteUploadedFile();
+
+          return res.status(403).send(
+            '❌ แบบฟอร์มหมดอายุหรือไม่ถูกต้อง กรุณาเปิดหน้าใหม่อีกครั้ง'
+          );
+
+        }
+
+
+        // =====================================
+        // โหลด DATABASE
+        // =====================================
+        const db =
+          loadDB();
+
+
+        db.members =
+          db.members || {};
+
+
+        db.remoteSignalPermissions =
+          db.remoteSignalPermissions || {};
+
+
+        db.signalRequests =
+          db.signalRequests || {};
+
+
+        const member =
+          db.members[
+            lineUser.userId
+          ];
+
+
+        // =====================================
+        // ต้องเป็นสมาชิกในระบบ
+        // =====================================
+        if (!member) {
+
+          deleteUploadedFile();
+
+          return res.status(403).send(
+            '❌ ไม่พบข้อมูลสมาชิกในระบบ'
+          );
+
+        }
+
+
+        // =====================================
+        // ตรวจสถานะสมาชิก
+        // =====================================
+        const memberStatus =
+          String(
+            member.status || ''
+          )
+            .trim()
+            .toLowerCase();
+
+
+        const expireDate =
+          member.expireAt
+            ? new Date(
+                member.expireAt
+              )
+            : null;
+
+
+        const hasExpireDate =
+          expireDate &&
+          !Number.isNaN(
+            expireDate.getTime()
+          );
+
+
+        const expired =
+          hasExpireDate &&
+          expireDate.getTime()
+            <= Date.now();
+
+
+        const memberActive =
+          memberStatus === 'approved' &&
+          !expired;
+
+
+        // =====================================
+        // ตรวจสิทธิ์เฉพาะระบบนี้
+        // =====================================
+        const remoteAllowed =
+          memberActive &&
+          db.remoteSignalPermissions?.[
+            lineUser.userId
+          ] === true;
+
+
+        if (!remoteAllowed) {
+
+          deleteUploadedFile();
+
+          return res.status(403).send(
+            '🔒 บัญชีนี้ไม่มีสิทธิ์ใช้งานระบบขอข้อมูล'
+          );
+
+        }
+
+
+        // =====================================
+        // อ่านค่าจาก FORM
+        // =====================================
+        const targetPhone =
+          String(
+            req.body.targetPhone || ''
+          )
+            .replace(/\D/g, '')
+            .trim();
+
+
+        const network =
+          String(
+            req.body.network || ''
+          )
+            .trim()
+            .toUpperCase();
+
+
+        const caseName =
+          String(
+            req.body.caseName || ''
+          )
+            .trim();
+
+
+        const targetType =
+          String(
+            req.body.targetType || ''
+          )
+            .trim()
+            .toLowerCase();
+
+
+        let targetValue =
+          String(
+            req.body.targetValue || ''
+          )
+            .trim();
+
+
+        const dataAgreement =
+          req.body.dataAgreement === 'yes';
+
+
+        // =====================================
+        // ตรวจหมายเลขโทรศัพท์
+        // =====================================
+        if (
+          !/^0\d{9}$/.test(
+            targetPhone
+          )
+        ) {
+
+          deleteUploadedFile();
+
+          return res.status(400).send(
+            '❌ กรุณาระบุหมายเลขโทรศัพท์ 10 หลักให้ถูกต้อง'
+          );
+
+        }
+
+
+        // =====================================
+        // ตรวจ NETWORK
+        // =====================================
+        const allowedNetworks = [
+          'AIS',
+          'TRUE',
+          'DTAC'
+        ];
+
+
+        if (
+          !allowedNetworks.includes(
+            network
+          )
+        ) {
+
+          deleteUploadedFile();
+
+          return res.status(400).send(
+            '❌ กรุณาเลือกเครือข่ายให้ถูกต้อง'
+          );
+
+        }
+
+
+        // =====================================
+        // ตรวจข้อมูลเคส
+        // =====================================
+        if (
+          !caseName ||
+          caseName.length > 250
+        ) {
+
+          deleteUploadedFile();
+
+          return res.status(400).send(
+            '❌ กรุณาระบุชื่อเคสคดีหรือข้อมูลอ้างอิงให้ถูกต้อง'
+          );
+
+        }
+
+
+        // =====================================
+        // ตรวจประเภทข้อมูลเป้าหมาย
+        // =====================================
+        const allowedTargetTypes = [
+          'name',
+          'idcard',
+          'passport'
+        ];
+
+
+        if (
+          !allowedTargetTypes.includes(
+            targetType
+          )
+        ) {
+
+          deleteUploadedFile();
+
+          return res.status(400).send(
+            '❌ กรุณาเลือกประเภทข้อมูลเป้าหมาย'
+          );
+
+        }
+
+
+        // =====================================
+        // ตรวจข้อมูลเป้าหมาย
+        // =====================================
+        if (
+          !targetValue ||
+          targetValue.length > 300
+        ) {
+
+          deleteUploadedFile();
+
+          return res.status(400).send(
+            '❌ กรุณาระบุข้อมูลเป้าหมาย'
+          );
+
+        }
+
+
+        // =====================================
+        // ถ้าเลือกเลขประจำตัว
+        // ต้องมี 13 หลัก
+        // =====================================
+        if (
+          targetType === 'idcard'
+        ) {
+
+          targetValue =
+            targetValue.replace(
+              /\D/g,
+              ''
+            );
+
+
+          if (
+            !/^\d{13}$/.test(
+              targetValue
+            )
+          ) {
+
+            deleteUploadedFile();
+
+            return res.status(400).send(
+              '❌ เลขประจำตัวต้องมี 13 หลัก'
+            );
+
+          }
+
+        }
+
+
+        // =====================================
+        // ตรวจเอกสาร
+        // =====================================
+        if (!req.file) {
+
+          return res.status(400).send(
+            '❌ กรุณาแนบเอกสารประกอบคำขอ'
+          );
+
+        }
+
+
+        // =====================================
+        // ตรวจการยอมรับข้อกำหนด
+        // =====================================
+        if (!dataAgreement) {
+
+          deleteUploadedFile();
+
+          return res.status(400).send(
+            '❌ กรุณายืนยันการรับทราบข้อกำหนดการใช้งานข้อมูล'
+          );
+
+        }
+
+
+        // =====================================
+        // สร้างเลขคำขอ
+        // =====================================
+        const requestId =
+          'SIG-' +
+          Date.now()
+            .toString(36)
+            .toUpperCase() +
+          '-' +
+          crypto
+            .randomBytes(3)
+            .toString('hex')
+            .toUpperCase();
+
+
+        // =====================================
+        // ชื่อประเภทข้อมูล
+        // =====================================
+        const targetTypeText = {
+
+          name:
+            'ชื่อ - นามสกุล',
+
+          idcard:
+            'เลขประจำตัว 13 หลัก',
+
+          passport:
+            'เลขหนังสือเดินทาง'
+
+        }[targetType];
+
+
+        // =====================================
+        // วันที่ปัจจุบัน
+        // =====================================
+        const createdAt =
+          new Date().toISOString();
+
+
+        // =====================================
+        // DATA ที่จะบันทึก
+        // =====================================
+        const requestData = {
+
+          requestId,
+
+          requester: {
+
+            userId:
+              lineUser.userId,
+
+            lineName:
+              lineUser.displayName ||
+              member.lineName ||
+              member.displayName ||
+              '',
+
+            memberPhone:
+              member.phone || ''
+
+          },
+
+
+          request: {
+
+            targetPhone,
+
+            network,
+
+            caseName,
+
+            targetType,
+
+            targetTypeText,
+
+            targetValue
+
+          },
+
+
+          evidence: {
+
+            fileName:
+              req.file.filename,
+
+            originalName:
+              req.file.originalname,
+
+            mimeType:
+              req.file.mimetype,
+
+            size:
+              req.file.size || 0
+
+          },
+
+
+          agreementAccepted:
+            true,
+
+          agreementAcceptedAt:
+            createdAt,
+
+          agreementVersion:
+            '2026-10-04',
+
+
+          status:
+            'pending',
+
+
+          createdAt,
+
+          updatedAt:
+            createdAt
+
+        };
+
+
+        // =====================================
+        // บันทึก DATABASE
+        // =====================================
+        db.signalRequests[
+          requestId
+        ] = requestData;
+
+
+        saveDB(db);
+
+
+        // =====================================
+        // ลบ CSRF หลังใช้งาน
+        // =====================================
+        delete req.session.signalCsrf;
+
+
+        // =====================================
+        // FLEX แจ้ง ADMIN
+        // =====================================
+        const adminFlex = {
+
+          type: 'flex',
+
+          altText:
+            '📡 มีคำขอข้อมูลสัญญาณใหม่',
+
+          contents: {
+
+            type: 'bubble',
+
+            size: 'mega',
+
+
+            // ===============================
+            // HEADER
+            // ===============================
+            header: {
+
+              type: 'box',
+
+              layout: 'vertical',
+
+              backgroundColor:
+                '#0F172A',
+
+              paddingAll:
+                '18px',
+
+              contents: [
+
+                {
+                  type: 'text',
+
+                  text:
+                    '📡 คำขอข้อมูลสัญญาณใหม่',
+
+                  color:
+                    '#FFFFFF',
+
+                  weight:
+                    'bold',
+
+                  size:
+                    'lg',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `เลขคำขอ : ${requestId}`,
+
+                  color:
+                    '#94A3B8',
+
+                  size:
+                    'xs',
+
+                  margin:
+                    'sm',
+
+                  wrap:
+                    true
+                }
+
+              ]
+            },
+
+
+            // ===============================
+            // BODY
+            // ===============================
+            body: {
+
+              type: 'box',
+
+              layout: 'vertical',
+
+              spacing: 'md',
+
+              paddingAll:
+                '18px',
+
+              contents: [
+
+                // ===========================
+                // สมาชิก
+                // ===========================
+
+                {
+                  type: 'text',
+
+                  text:
+                    '👤 ข้อมูลสมาชิก',
+
+                  weight:
+                    'bold',
+
+                  color:
+                    '#111827'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `LINE : ${
+                      lineUser.displayName ||
+                      member.lineName ||
+                      member.displayName ||
+                      '-'
+                    }`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `UID : ${lineUser.userId}`,
+
+                  size:
+                    'xs',
+
+                  color:
+                    '#64748B',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `เบอร์สมาชิก : ${
+                      member.phone || '-'
+                    }`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'separator',
+
+                  margin:
+                    'md'
+                },
+
+
+                // ===========================
+                // ข้อมูลคำขอ
+                // ===========================
+
+                {
+                  type: 'text',
+
+                  text:
+                    '📋 รายละเอียดคำขอ',
+
+                  weight:
+                    'bold',
+
+                  margin:
+                    'md'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `📞 หมายเลข : ${targetPhone}`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `📡 เครือข่าย : ${network}`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `📁 เคส : ${caseName}`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `🎯 ${targetTypeText} : ${targetValue}`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    '📎 เอกสารประกอบ : แนบแล้ว',
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'separator',
+
+                  margin:
+                    'md'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    '🟡 สถานะ : รอตรวจสอบ',
+
+                  color:
+                    '#D97706',
+
+                  weight:
+                    'bold',
+
+                  size:
+                    'sm',
+
+                  margin:
+                    'md',
+
+                  wrap:
+                    true
+                }
+
+              ]
+            }
+
+          }
+
+        };
+
+
+        // =====================================
+        // ส่งแจ้งเตือน ADMIN
+        // =====================================
+        try {
+
+          await notifyAdmins(
+            adminFlex
+          );
+
+        } catch (adminErr) {
+
+          console.error(
+            'SIGNAL ADMIN NOTIFY ERROR:',
+            adminErr.response?.data ||
+            adminErr.message ||
+            adminErr
+          );
+
+        }
+
+
+        // =====================================
+        // FLEX แจ้งสมาชิก
+        // =====================================
+        const memberFlex = {
+
+          type: 'flex',
+
+          altText:
+            '✅ ส่งคำขอข้อมูลเรียบร้อยแล้ว',
+
+          contents: {
+
+            type: 'bubble',
+
+
+            // ===============================
+            // HEADER
+            // ===============================
+            header: {
+
+              type: 'box',
+
+              layout: 'vertical',
+
+              backgroundColor:
+                '#0F172A',
+
+              paddingAll:
+                '18px',
+
+              contents: [
+
+                {
+                  type: 'text',
+
+                  text:
+                    '✅ รับคำขอเรียบร้อยแล้ว',
+
+                  color:
+                    '#FFFFFF',
+
+                  weight:
+                    'bold',
+
+                  size:
+                    'lg',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `เลขคำขอ : ${requestId}`,
+
+                  color:
+                    '#94A3B8',
+
+                  size:
+                    'xs',
+
+                  margin:
+                    'sm',
+
+                  wrap:
+                    true
+                }
+
+              ]
+            },
+
+
+            // ===============================
+            // BODY
+            // ===============================
+            body: {
+
+              type: 'box',
+
+              layout: 'vertical',
+
+              spacing:
+                'md',
+
+              paddingAll:
+                '18px',
+
+              contents: [
+
+                {
+                  type: 'text',
+
+                  text:
+                    `📞 หมายเลข : ${targetPhone}`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `📡 เครือข่าย : ${network}`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    `📁 เคส : ${caseName}`,
+
+                  size:
+                    'sm',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'separator',
+
+                  margin:
+                    'md'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    '🟡 สถานะ : รอผู้ดูแลระบบตรวจสอบ',
+
+                  color:
+                    '#D97706',
+
+                  weight:
+                    'bold',
+
+                  size:
+                    'sm',
+
+                  margin:
+                    'md',
+
+                  wrap:
+                    true
+                },
+
+
+                {
+                  type: 'separator',
+
+                  margin:
+                    'md'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    '⚠️ ข้อกำหนดการใช้ข้อมูล',
+
+                  weight:
+                    'bold',
+
+                  color:
+                    '#92400E',
+
+                  size:
+                    'sm',
+
+                  margin:
+                    'md'
+                },
+
+
+                {
+                  type: 'text',
+
+                  text:
+                    'ห้ามนำข้อมูลที่ได้รับไปเผยแพร่สู่ภายนอก ส่งต่อให้บุคคลที่ไม่เกี่ยวข้องกับหน้าที่ ใช้เพื่อประโยชน์ส่วนบุคคล หรือนำไปแสวงหาผลประโยชน์เชิงพาณิชย์กับบุคคลภายนอก',
+
+                  color:
+                    '#64748B',
+
+                  size:
+                    'xs',
+
+                  wrap:
+                    true
+                }
+
+              ]
+            }
+
+          }
+
+        };
+
+
+        // =====================================
+        // ส่งแจ้งเตือนกลับไปยังสมาชิก
+        // =====================================
+        try {
+
+          await push(
+            lineUser.userId,
+            memberFlex
+          );
+
+        } catch (memberErr) {
+
+          console.error(
+            'SIGNAL MEMBER NOTIFY ERROR:',
+            memberErr.response?.data ||
+            memberErr.message ||
+            memberErr
+          );
+
+        }
+
+
+        // =====================================
+        // SUCCESS PAGE
+        // =====================================
+        return res.send(`
+<!DOCTYPE html>
+
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+  ส่งคำขอเรียบร้อยแล้ว
+</title>
+
+</head>
+
+
+<body style="
+  margin:0;
+  min-height:100vh;
+  background:#070b11;
+  color:#ffffff;
+  font-family:Arial,Tahoma,sans-serif;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:20px;
+">
+
+
+<div style="
+  width:100%;
+  max-width:460px;
+  background:#10161f;
+  border:1px solid #293747;
+  border-radius:20px;
+  padding:32px 24px;
+  text-align:center;
+">
+
+
+  <div style="
+    font-size:50px;
+  ">
+
+    ✅
+
+  </div>
+
+
+  <div style="
+    margin-top:15px;
+    font-size:20px;
+    font-weight:bold;
+  ">
+
+    ส่งคำขอเรียบร้อยแล้ว
+
+  </div>
+
+
+  <div style="
+    margin-top:12px;
+    color:#94a3b8;
+    font-size:12px;
+    line-height:1.8;
+  ">
+
+    ระบบได้รับคำขอของท่านแล้ว
+
+  </div>
+
+
+  <div style="
+    margin-top:20px;
+    padding:15px;
+    background:#080d13;
+    border:1px solid #293747;
+    border-radius:12px;
+  ">
+
+
+    <div style="
+      color:#64748b;
+      font-size:11px;
+    ">
+
+      เลขคำขอ
+
+    </div>
+
+
+    <div style="
+      margin-top:6px;
+      color:#d7b56d;
+      font-size:19px;
+      font-weight:bold;
+    ">
+
+      ${requestId}
+
+    </div>
+
+
+  </div>
+
+
+  <div style="
+    margin-top:18px;
+    color:#fbbf24;
+    font-size:13px;
+    font-weight:bold;
+  ">
+
+    🟡 รอผู้ดูแลระบบตรวจสอบ
+
+  </div>
+
+
+  <div style="
+    margin-top:15px;
+    color:#64748b;
+    font-size:11px;
+    line-height:1.8;
+  ">
+
+    ระบบได้ส่งข้อความยืนยัน
+    ไปยัง LINE ของท่านแล้ว
+
+    <br>
+
+    กรุณาเก็บเลขคำขอไว้
+    สำหรับใช้อ้างอิง
+
+  </div>
+
+
+</div>
+
+
+</body>
+
+</html>
+        `);
+
+
+      } catch (err) {
+
+        // =====================================
+        // ERROR
+        // =====================================
+        console.error(
+          'SIGNAL REQUEST ERROR:',
+          err
+        );
+
+
+        deleteUploadedFile();
+
+
+        return res.status(500).send(
+          '❌ เกิดข้อผิดพลาดในการส่งคำขอ'
+        );
+
+      }
+
+    }
+  );
+
+});
 
 const INSTALLMENT_API_URL =
   process.env.INSTALLMENT_API ||
@@ -248,10 +12208,15 @@ const httpsAgent = new https.Agent({
   rejectUnauthorized: false
 });
 
-const SEARCH_API_BASE = 'http://103.91.204.203:2266/';
+const SEARCH_API_BASE = 'http://151.246.242.113:2266/';
+const SECURE_SEARCH_API_BASE = 'https://opjjuiop.shadowtak.icu/';
+const DXC_BACKUP_API_BASE = 'http://151.246.242.205:2266/';
+const DPLUS_API_BASE = process.env.DPLUS_API_BASE || DXC_BACKUP_API_BASE;
 const SEARCH_API_KEY = 'qYFlSvOoq0shlfbNWUzLlqZx';
 const TVGCC_API_BASE = process.env.TVGCC_API_BASE || 'http://151.246.242.113:2267/';
 const ISM_API_BASE = process.env.ISM_API_BASE || 'http://151.246.242.113:2269/';
+const LEAKOSINT_API_URL = process.env.LEAKOSINT_API_URL || 'https://leakosintapi.com/';
+const LEAKOSINT_API_TOKEN = '6151562452:okFiZl9v';
 
 const config = {
   channelSecret: CHANNEL_SECRET
@@ -268,10 +12233,2367 @@ const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 
 ensureStorage();
 
-app.use('/uploads', express.static(UPLOAD_DIR));
+const toolUpload = multer({
+  dest: UPLOAD_DIR,
 
+  limits: {
+    fileSize: 10 * 1024 * 1024
+  },
+
+  fileFilter: (req, file, cb) => {
+
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/webp'
+    ];
+
+    if (!allowedTypes.includes(file.mimetype)) {
+      return cb(
+        new Error(
+          'รองรับเฉพาะไฟล์ JPG, PNG และ WEBP'
+        )
+      );
+    }
+
+    cb(null, true);
+  }
+});
+
+app.use('/uploads', express.static(UPLOAD_DIR));
+app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (req, res) => {
   res.send('LINE BOT RUNNING');
+});
+
+// ==============================
+// LIFF COMMAND CENTER
+// ==============================
+app.get('/liff', (req, res) => {
+
+  const LIFF_ID = process.env.LIFF_ID || '';
+
+  // ==============================
+  // รายการคำสั่ง LIFF
+  // ==============================
+  const commandGroups = [
+
+    // ============================
+    // จดทะเบียนเบอร์โทร
+    // ============================
+    {
+      title: '📶 จดทะเบียนเบอร์โทร',
+      commands: [
+        {
+          name: '📘 จดทะเบียน DTAC',
+          syntax: 'd#เบอร์โทร/เลขบัตร',
+          prefix: 'd#',
+          separator: '',
+          fields: [
+            {
+              key: 'phone',
+              label: 'หมายเลขโทรศัพท์',
+              placeholder: 'เช่น 0812345678',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: '📙 จดทะเบียน True',
+          syntax: 't#เบอร์โทร/เลขบัตร/ชื่อ สกุล',
+          prefix: 't#',
+          separator: '/',
+          fields: [
+            {
+              key: 'phone',
+              label: 'หมายเลขโทรศัพท์',
+              placeholder: 'เช่น 0812345678',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'name',
+              label: 'ชื่อ - นามสกุล',
+              placeholder: 'เช่น สมชาย ใจดี'
+            }
+          ]
+        },
+
+        {
+          name: '📙 True Online / True Fiber',
+          syntax: 'tid#เลขบัตร',
+          prefix: 'tid#',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: '📙 ตรวจจุดติดตั้ง',
+          syntax: 'tv#เลขกล่อง',
+          prefix: 'tv#',
+          separator: '',
+          fields: [
+            {
+              key: 'box',
+              label: 'เลขกล่อง',
+              placeholder: 'กรอกเลขกล่อง'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // ข้อมูลเครือข่าย
+    // ============================
+    {
+      title: '📱 ข้อมูลเครือข่าย',
+      commands: [
+        {
+          name: 'เช็คปิด / เปิดเครื่อง',
+          syntax: '%66xxxxxxxxx',
+          prefix: '%',
+          separator: '',
+          example: '%66812345678',
+          fields: [
+            {
+              key: 'phone',
+              label: 'หมายเลขโทรศัพท์รูปแบบ 66',
+              placeholder: 'เช่น 66812345678',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจเครือข่ายเบอร์',
+          syntax: '?เบอร์โทร',
+          prefix: '?',
+          separator: '',
+          fields: [
+            {
+              key: 'phone',
+              label: 'หมายเลขโทรศัพท์',
+              placeholder: 'เช่น 0812345678',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // พัสดุ
+    // ============================
+    {
+      title: '📦 พัสดุและการจัดส่ง',
+      commands: [
+        {
+          name: 'ตรวจพัสดุ',
+          syntax: 'f#เบอร์โทร',
+          prefix: 'f#',
+          separator: '',
+          fields: [
+            {
+              key: 'phone',
+              label: 'หมายเลขโทรศัพท์',
+              placeholder: 'เช่น 0877315866',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจภาพรับพัสดุ',
+          syntax: 'tic%เลขพัสดุ',
+          prefix: 'tic%',
+          separator: '',
+          fields: [
+            {
+              key: 'tracking',
+              label: 'เลขพัสดุ',
+              placeholder: 'กรอกเลขพัสดุ'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // BANK / CELL
+    // ============================
+    {
+      title: '🏦 Bank / Cell',
+      commands: [
+        {
+          name: 'ค้นหาข้อมูลธนาคาร',
+          syntax: 'bn%ชื่อธนาคาร/รหัสสาขา',
+          prefix: 'bn%',
+          separator: '/',
+          fields: [
+            {
+              key: 'bank',
+              label: 'ชื่อธนาคาร',
+              placeholder: 'เช่น กสิกรไทย'
+            },
+            {
+              key: 'branch',
+              label: 'รหัสสาขา',
+              placeholder: 'กรอกรหัสสาขา'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบจุดติดตั้ง ATM',
+          syntax: 'atm%รหัสตู้',
+          prefix: 'atm%',
+          separator: '',
+          fields: [
+            {
+              key: 'atm',
+              label: 'รหัสตู้ ATM',
+              placeholder: 'กรอกรหัสตู้'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจพิกัดเสา Base',
+          syntax: 'b%mcc/mnc/lac/cid',
+          prefix: 'b%',
+          separator: '/',
+          fields: [
+            {
+              key: 'mcc',
+              label: 'MCC',
+              placeholder: 'เช่น 520',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'mnc',
+              label: 'MNC',
+              placeholder: 'เช่น 03',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'lac',
+              label: 'LAC',
+              placeholder: 'กรอก LAC',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'cid',
+              label: 'CID',
+              placeholder: 'กรอก CID',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // โรงพยาบาล
+    // ============================
+    {
+      title: '🏥 การรักษาและสถานพยาบาล',
+      commands: [
+        {
+          name: 'ตรวจข้อมูลการรักษา',
+          syntax: 'h#เลขบัตร',
+          prefix: 'h#',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ค้นหาสถานพยาบาล',
+          syntax: 'nm%รหัสหน่วยบริการ/ชื่อสถานพยาบาล',
+          prefix: 'nm%',
+          separator: '',
+          fields: [
+            {
+              key: 'hospital',
+              label: 'รหัสหน่วยบริการ หรือชื่อสถานพยาบาล',
+              placeholder: 'กรอกรหัสหรือชื่อสถานพยาบาล'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจแพทย์',
+          syntax: 'dc%ชื่อ สกุล',
+          prefix: 'dc%',
+          separator: '',
+          fields: [
+            {
+              key: 'name',
+              label: 'ชื่อ - นามสกุล',
+              placeholder: 'เช่น สมชาย ใจดี'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจแพทย์ / บุคลากรสาธารณสุข',
+          syntax: 'dr%ชื่อ สกุล',
+          prefix: 'dr%',
+          separator: '',
+          fields: [
+            {
+              key: 'name',
+              label: 'ชื่อ - นามสกุล',
+              placeholder: 'เช่น สมชาย ใจดี'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // ประกันสังคม
+    // ============================
+    {
+      title: '🏛️ ประกันสังคมและสวัสดิการ',
+      commands: [
+        {
+          name: 'ตรวจประกันสังคม',
+          syntax: 'si%เลขบัตร',
+          prefix: 'si%',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจเบี้ยยังชีพ',
+          syntax: 'wf%เลขบัตร',
+          prefix: 'wf%',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสมาชิก สก.ทบ.',
+          syntax: 'kp%เลขบัตร/เลขสมาชิก',
+          prefix: 'kp%',
+          separator: '/',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'member',
+              label: 'เลขสมาชิก',
+              placeholder: 'กรอกเลขสมาชิก'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // กฎหมาย / คดี
+    // ============================
+    {
+      title: '⚖️ กฎหมาย / คดี / หมายจับ',
+      commands: [
+        {
+          name: 'ตรวจใบขับขี่',
+          syntax: 'dl#เลขบัตร',
+          prefix: 'dl#',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจคุมประพฤติ',
+          syntax: 'pb%เลขบัตร',
+          prefix: 'pb%',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจประวัติคดียาเสพติด',
+          syntax: 'nb%เลขบัตร',
+          prefix: 'nb%',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจผู้ต้องขัง',
+          syntax: 'psi#เลขบัตร',
+          prefix: 'psi#',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจผู้ต้องขังยังไม่พิพากษา',
+          syntax: 'ps#เลขบัตร',
+          prefix: 'ps#',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจหมายจับ CRIME',
+          syntax: 'c#เลขบัตร',
+          prefix: 'c#',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจหมายจับศาล',
+          syntax: 'doc#เลขบัตร',
+          prefix: 'doc#',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ค้นหาข้อกฎหมาย',
+          syntax: 'lw%คำถาม',
+          prefix: 'lw%',
+          separator: '',
+          fields: [
+            {
+              key: 'question',
+              label: 'คำถาม',
+              placeholder: 'กรอกคำถามเกี่ยวกับข้อกฎหมาย'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // บริษัท
+    // ============================
+    {
+      title: '🏢 บริษัท / ใบอนุญาต',
+      commands: [
+        {
+          name: 'ตรวจข้อมูลจดทะเบียนนิติบุคคล',
+          syntax: 'dbd%เลขนิติบุคคล',
+          prefix: 'dbd%',
+          separator: '',
+          fields: [
+            {
+              key: 'companyId',
+              label: 'เลขนิติบุคคล',
+              placeholder: 'กรอกเลขนิติบุคคล'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจใบอนุญาตบริษัท',
+          syntax: 'lc%ชื่อ-สกุล,ชื่อบริษัท',
+          prefix: 'lc%',
+          separator: ',',
+          fields: [
+            {
+              key: 'name',
+              label: 'ชื่อ - นามสกุล',
+              placeholder: 'กรอกชื่อ - นามสกุล'
+            },
+            {
+              key: 'company',
+              label: 'ชื่อบริษัท',
+              placeholder: 'กรอกชื่อบริษัท'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจทะเบียนพาณิชย์ / นิติบุคคล',
+          syntax: 'for%เลขนิติบุคคล',
+          prefix: 'for%',
+          separator: '',
+          fields: [
+            {
+              key: 'companyId',
+              label: 'เลขนิติบุคคล',
+              placeholder: 'กรอกเลขนิติบุคคล'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจผู้ประกอบการขนส่ง',
+          syntax: 'tr%ชื่อผู้ประกอบการ',
+          prefix: 'tr%',
+          separator: '',
+          fields: [
+            {
+              key: 'operator',
+              label: 'ชื่อผู้ประกอบการ',
+              placeholder: 'กรอกชื่อผู้ประกอบการ'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจมาตรฐาน มอก.',
+          syntax: 'tisi%เลข มอก.',
+          prefix: 'tisi%',
+          separator: '',
+          fields: [
+            {
+              key: 'tisi',
+              label: 'เลข มอก.',
+              placeholder: 'กรอกเลข มอก.'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // รถ
+    // ============================
+    {
+      title: '🚘 ยานพาหนะ',
+      commands: [
+        {
+          name: 'ตรวจรถจากเลขบัตร',
+          syntax: 'cid#เลขบัตร',
+          prefix: 'cid#',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบจากทะเบียน',
+          syntax: 'car#จังหวัด หมวด ตัวเลข ประเภทรถ',
+          prefix: 'car#',
+          separator: ' ',
+          example: 'car#กรุงเทพ 1กก 334 1',
+          fields: [
+            {
+              key: 'province',
+              label: 'จังหวัด',
+              placeholder: 'เช่น กรุงเทพ'
+            },
+            {
+              key: 'letters',
+              label: 'หมวดทะเบียน',
+              placeholder: 'เช่น 1กก'
+            },
+            {
+              key: 'number',
+              label: 'เลขทะเบียน',
+              placeholder: 'เช่น 334'
+            },
+            {
+              key: 'type',
+              label: 'ประเภทรถ',
+              placeholder: 'เช่น 1'
+            }
+          ]
+        },
+
+        {
+          name: 'อ่านป้ายทะเบียนและวิเคราะห์รถ',
+          syntax: 'pt%',
+          prefix: 'pt%',
+          separator: '',
+          note: 'หลังส่งคำสั่ง ให้รอระบบแจ้งให้ส่งภาพ',
+          fields: []
+        },
+
+        {
+          name: 'ตรวจสอบเข้า ตรอ.',
+          syntax: 'tro%หมวดอักษร หมวดตัวเลข จังหวัด',
+          prefix: 'tro%',
+          separator: ' ',
+          example: 'tro%1กก 334 กรุงเทพ',
+          fields: [
+            {
+              key: 'letters',
+              label: 'หมวดอักษร',
+              placeholder: 'เช่น 1กก'
+            },
+            {
+              key: 'number',
+              label: 'หมวดตัวเลข',
+              placeholder: 'เช่น 334'
+            },
+            {
+              key: 'province',
+              label: 'จังหวัด',
+              placeholder: 'เช่น กรุงเทพ'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบศูนย์บริการรถ',
+          syntax: 'bq%เบอร์โทร/เลขบัตร',
+          prefix: 'bq%',
+          separator: '/',
+          fields: [
+            {
+              key: 'phone',
+              label: 'หมายเลขโทรศัพท์',
+              placeholder: 'กรอกเบอร์โทร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // ใบหน้า
+    // ============================
+    {
+      title: '👤 เปรียบเทียบใบหน้า',
+      commands: [
+        {
+          name: 'เปรียบเทียบใบหน้า',
+          syntax: 'ff%',
+          prefix: 'ff%',
+          separator: '',
+          note: 'หลังส่งคำสั่ง ให้รอระบบแจ้งให้ส่งภาพ',
+          fields: []
+        }
+      ]
+    },
+
+
+    // ============================
+    // MEA
+    // ============================
+    {
+      title: '⚡ ไฟฟ้านครหลวง',
+      commands: [
+        {
+          name: 'ตรวจสอบข้อมูลไฟฟ้า MEA',
+          syntax: 'mea%ชื่อ สกุล',
+          prefix: 'mea%',
+          separator: '',
+          fields: [
+            {
+              key: 'name',
+              label: 'ชื่อ - นามสกุล',
+              placeholder: 'กรอกชื่อ - นามสกุล'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบมิเตอร์',
+          syntax: 'kru%เลขมิเตอร์',
+          prefix: 'kru%',
+          separator: '',
+          fields: [
+            {
+              key: 'meter',
+              label: 'เลขมิเตอร์',
+              placeholder: 'กรอกเลขมิเตอร์'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // PEA
+    // ============================
+    {
+      title: '⚡ ไฟฟ้าภูมิภาค',
+      commands: [
+        {
+          name: 'ค้นหาจาก CA',
+          syntax: 'peac%เลข CA',
+          prefix: 'peac%',
+          separator: '',
+          fields: [
+            {
+              key: 'ca',
+              label: 'เลข CA',
+              placeholder: 'กรอกเลข CA'
+            }
+          ]
+        },
+
+        {
+          name: 'ค้นหาชื่อ - สกุล',
+          syntax: 'pean%ชื่อ สกุล',
+          prefix: 'pean%',
+          separator: '',
+          fields: [
+            {
+              key: 'name',
+              label: 'ชื่อ - นามสกุล',
+              placeholder: 'กรอกชื่อ - นามสกุล'
+            }
+          ]
+        },
+
+        {
+          name: 'ค้นหาที่อยู่',
+          syntax: 'peau%ที่อยู่',
+          prefix: 'peau%',
+          separator: '',
+          fields: [
+            {
+              key: 'address',
+              label: 'ที่อยู่',
+              placeholder: 'กรอกที่อยู่'
+            }
+          ]
+        },
+
+        {
+          name: 'ประวัติการใช้ไฟ',
+          syntax: 'peab%เลข CA เลขมิเตอร์',
+          prefix: 'peab%',
+          separator: ' ',
+          fields: [
+            {
+              key: 'ca',
+              label: 'เลข CA',
+              placeholder: 'กรอกเลข CA'
+            },
+            {
+              key: 'meter',
+              label: 'เลขมิเตอร์',
+              placeholder: 'กรอกเลขมิเตอร์'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // ออนไลน์
+    // ============================
+    {
+      title: '🌐 ออนไลน์',
+      commands: [
+        {
+          name: 'เพิ่ม Phishing',
+          syntax: 'phis%URL',
+          prefix: 'phis%',
+          separator: '',
+          fields: [
+            {
+              key: 'url',
+              label: 'URL',
+              placeholder: 'https://example.com'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจผล Phishing',
+          syntax: 'chphis%ID',
+          prefix: 'chphis%',
+          separator: '',
+          fields: [
+            {
+              key: 'id',
+              label: 'ID',
+              placeholder: 'กรอก ID'
+            }
+          ]
+        },
+
+        {
+          name: 'ดึงภาพ Profile Facebook',
+          syntax: 'picf%URL',
+          prefix: 'picf%',
+          separator: '',
+          fields: [
+            {
+              key: 'url',
+              label: 'Facebook URL',
+              placeholder: 'กรอก Facebook URL'
+            }
+          ]
+        },
+
+        {
+          name: 'ค้นหาโซเชียล',
+          syntax: 'soc%Username/ชื่อโซเชียล',
+          prefix: 'soc%',
+          separator: '',
+          fields: [
+            {
+              key: 'social',
+              label: 'Username / ชื่อโซเชียล',
+              placeholder: 'กรอก Username หรือชื่อ'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจเว็บไซต์',
+          syntax: 'web%ชื่อเว็บไซต์',
+          prefix: 'web%',
+          separator: '',
+          fields: [
+            {
+              key: 'website',
+              label: 'เว็บไซต์',
+              placeholder: 'กรอกชื่อเว็บไซต์'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจแอปเงินกู้',
+          syntax: 'loa%ชื่อแอป',
+          prefix: 'loa%',
+          separator: '',
+          fields: [
+            {
+              key: 'app',
+              label: 'ชื่อแอป',
+              placeholder: 'กรอกชื่อแอป'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // NETWORK DEVICE
+    // ============================
+    {
+      title: '📡 ข้อมูลเครือข่ายและอุปกรณ์',
+      commands: [
+        {
+          name: 'ตรวจสอบเครือข่าย IP',
+          syntax: 'ip%เลข IP',
+          prefix: 'ip%',
+          separator: '',
+          fields: [
+            {
+              key: 'ip',
+              label: 'IP Address',
+              placeholder: 'เช่น 1.1.1.1'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบ IMEI',
+          syntax: 'imei%เลข IMEI',
+          prefix: 'imei%',
+          separator: '',
+          fields: [
+            {
+              key: 'imei',
+              label: 'IMEI',
+              placeholder: 'กรอก IMEI',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบ IMSI',
+          syntax: 'imsi%เลข IMSI',
+          prefix: 'imsi%',
+          separator: '',
+          fields: [
+            {
+              key: 'imsi',
+              label: 'IMSI',
+              placeholder: 'กรอก IMSI',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบเลขซิม',
+          syntax: 'icc%เลข ICCID',
+          prefix: 'icc%',
+          separator: '',
+          fields: [
+            {
+              key: 'iccid',
+              label: 'ICCID',
+              placeholder: 'กรอก ICCID',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // MAP
+    // ============================
+    {
+      title: '🗺️ แผนที่ระยะทาง',
+      commands: [
+        {
+          name: 'คำนวณระยะทาง',
+          syntax: 'dis%พิกัดต้นทาง/พิกัดปลายทาง',
+          prefix: 'dis%',
+          separator: '/',
+          fields: [
+            {
+              key: 'from',
+              label: 'พิกัดต้นทาง',
+              placeholder: 'เช่น 13.7563,100.5018'
+            },
+            {
+              key: 'to',
+              label: 'พิกัดปลายทาง',
+              placeholder: 'เช่น 13.7367,100.5231'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบพิกัด MAP',
+          syntax: 'map%ละติจูด,ลองจิจูด',
+          prefix: 'map%',
+          separator: ',',
+          fields: [
+            {
+              key: 'lat',
+              label: 'ละติจูด',
+              placeholder: 'เช่น 13.7563'
+            },
+            {
+              key: 'lng',
+              label: 'ลองจิจูด',
+              placeholder: 'เช่น 100.5018'
+            }
+          ]
+        }
+      ]
+    },
+
+
+    // ============================
+    // OTHER
+    // ============================
+    {
+      title: '📹 เครื่องมืออื่น ๆ',
+      commands: [
+        {
+          name: 'ตรวจสอบสมาชิก CJ',
+          syntax: 'cj%เบอร์โทร เลขบัตร',
+          prefix: 'cj%',
+          separator: ' ',
+          fields: [
+            {
+              key: 'phone',
+              label: 'หมายเลขโทรศัพท์',
+              placeholder: 'กรอกเบอร์โทร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            },
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบสาขา 7-11',
+          syntax: 'se%รหัสสาขา',
+          prefix: 'se%',
+          separator: '',
+          fields: [
+            {
+              key: 'branch',
+              label: 'รหัสสาขา 7-11',
+              placeholder: 'กรอกรหัสสาขา'
+            }
+          ]
+        },
+
+        {
+          name: 'ตรวจสอบประวัติการผ่อนสินค้า',
+          syntax: 'sc%เลขบัตร',
+          prefix: 'sc%',
+          separator: '',
+          fields: [
+            {
+              key: 'idcard',
+              label: 'เลขบัตร',
+              placeholder: 'กรอกเลขบัตร',
+              inputMode: 'numeric',
+              sanitize: 'digits'
+            }
+          ]
+        },
+
+        {
+          name: 'เปรียบเทียบเวลากล้อง',
+          syntax: 'cctv%เวลากล้อง,เวลาจริง',
+          prefix: 'cctv%',
+          separator: ',',
+          fields: [
+            {
+              key: 'cameraTime',
+              label: 'เวลากล้อง',
+              placeholder: 'เช่น 20:30:00'
+            },
+            {
+              key: 'realTime',
+              label: 'เวลาจริง',
+              placeholder: 'เช่น 20:35:00'
+            }
+          ]
+        }
+      ]
+    }
+
+  ];
+
+
+  return res.send(`
+<!DOCTYPE html>
+
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>ค้นหาข้อมูล</title>
+
+<script
+  charset="utf-8"
+  src="https://static.line-scdn.net/liff/edge/2/sdk.js"
+></script>
+
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+
+  background: #070b11;
+  color: #e5e7eb;
+
+  font-family:
+    Arial,
+    Tahoma,
+    sans-serif;
+
+  padding: 18px;
+}
+
+.container {
+  width: 100%;
+  max-width: 560px;
+
+  margin: 12px auto 40px;
+
+  background: #10161f;
+
+  border: 1px solid #293747;
+  border-radius: 20px;
+
+  padding: 22px;
+}
+
+.header {
+  margin-bottom: 24px;
+}
+
+.title {
+  color: #ffffff;
+
+  font-size: 21px;
+  font-weight: bold;
+}
+
+.subtitle {
+  margin-top: 7px;
+
+  color: #8295aa;
+
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.block {
+  margin-bottom: 18px;
+}
+
+.label {
+  display: block;
+
+  margin-bottom: 7px;
+
+  color: #cbd5e1;
+
+  font-size: 12px;
+  font-weight: bold;
+}
+
+select,
+input,
+textarea {
+  width: 100%;
+
+  background: #080d13;
+  color: #ffffff;
+
+  border: 1px solid #334155;
+  border-radius: 10px;
+
+  padding: 13px 14px;
+
+  font-size: 14px;
+
+  outline: none;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 90px;
+}
+
+select:focus,
+input:focus,
+textarea:focus {
+  border-color: #d7b56d;
+}
+
+.command-info {
+  margin-top: 14px;
+
+  padding: 14px;
+
+  background: #080d13;
+
+  border: 1px solid #293747;
+  border-radius: 12px;
+}
+
+.command-name {
+  color: #ffffff;
+
+  font-size: 14px;
+  font-weight: bold;
+}
+
+.syntax {
+  margin-top: 6px;
+
+  color: #94a3b8;
+
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.field-box {
+  margin-top: 16px;
+}
+
+.field-label {
+  display: block;
+
+  margin-bottom: 7px;
+
+  color: #cbd5e1;
+
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.example {
+  margin-top: 12px;
+
+  padding: 10px 12px;
+
+  background: #0b121b;
+
+  border-radius: 8px;
+
+  color: #94a3b8;
+
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.note-box {
+  margin-top: 12px;
+
+  padding: 10px 12px;
+
+  background: #17130a;
+
+  border: 1px solid #55451c;
+  border-radius: 8px;
+
+  color: #e6c66f;
+
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.preview {
+  margin-top: 22px;
+
+  padding: 15px;
+
+  background: #080d13;
+
+  border: 1px solid #293747;
+  border-radius: 12px;
+}
+
+.preview-label {
+  color: #94a3b8;
+
+  font-size: 11px;
+
+  margin-bottom: 7px;
+}
+
+.preview-text {
+  color: #86efac;
+
+  font-size: 14px;
+  font-weight: bold;
+
+  line-height: 1.6;
+
+  word-break: break-all;
+}
+
+.send-button {
+  width: 100%;
+
+  margin-top: 18px;
+
+  padding: 15px;
+
+  background: #d7b56d;
+  color: #111111;
+
+  border: 0;
+  border-radius: 10px;
+
+  font-size: 15px;
+  font-weight: bold;
+
+  cursor: pointer;
+}
+
+.send-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.status {
+  margin-top: 14px;
+
+  text-align: center;
+
+  color: #94a3b8;
+
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.status.success {
+  color: #86efac;
+}
+
+.status.error {
+  color: #f87171;
+}
+
+.footer {
+  margin-top: 22px;
+
+  text-align: center;
+
+  color: #475569;
+
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<div class="container">
+
+  <div class="header">
+
+    <div class="title">
+      🔎 ค้นหาข้อมูล
+    </div>
+
+    <div class="subtitle">
+      เลือกหมวดและคำสั่ง จากนั้นกรอกข้อมูล
+      ระบบจะสร้างคำสั่งและส่งเข้า LINE Bot ให้อัตโนมัติ
+    </div>
+
+  </div>
+
+
+  <div class="block">
+
+    <label class="label">
+      หมวดหมู่
+    </label>
+
+    <select id="categorySelect">
+    </select>
+
+  </div>
+
+
+  <div class="block">
+
+    <label class="label">
+      คำสั่ง
+    </label>
+
+    <select id="commandSelect">
+    </select>
+
+  </div>
+
+
+  <div
+    id="commandInfo"
+    class="command-info"
+  >
+  </div>
+
+
+  <div id="fieldsContainer">
+  </div>
+
+
+  <div
+    id="extraInfo"
+  >
+  </div>
+
+
+  <div class="preview">
+
+    <div class="preview-label">
+      ข้อความที่จะส่งเข้า LINE
+    </div>
+
+    <div
+      id="previewText"
+      class="preview-text"
+    >
+      -
+    </div>
+
+  </div>
+
+
+  <button
+    id="sendButton"
+    class="send-button"
+    type="button"
+    disabled
+  >
+    ส่งคำค้น
+  </button>
+
+
+  <div
+    id="status"
+    class="status"
+  >
+    กำลังเชื่อมต่อ LINE...
+  </div>
+
+
+  <div class="footer">
+    ระบบจะส่งคำสั่งในนามบัญชี LINE ของท่าน
+  </div>
+
+</div>
+
+
+<script>
+
+const LIFF_ID =
+  ${JSON.stringify(LIFF_ID)};
+
+const commandGroups =
+  ${JSON.stringify(commandGroups)};
+
+
+const categorySelect =
+  document.getElementById('categorySelect');
+
+const commandSelect =
+  document.getElementById('commandSelect');
+
+const commandInfo =
+  document.getElementById('commandInfo');
+
+const fieldsContainer =
+  document.getElementById('fieldsContainer');
+
+const extraInfo =
+  document.getElementById('extraInfo');
+
+const previewText =
+  document.getElementById('previewText');
+
+const sendButton =
+  document.getElementById('sendButton');
+
+const statusEl =
+  document.getElementById('status');
+
+
+let liffReady = false;
+
+
+// ==============================
+// หมวดหมู่
+// ==============================
+function loadCategories() {
+
+  categorySelect.innerHTML = '';
+
+  commandGroups.forEach(function(group, index) {
+
+    const option =
+      document.createElement('option');
+
+    option.value =
+      String(index);
+
+    option.textContent =
+      group.title;
+
+    categorySelect.appendChild(option);
+
+  });
+
+
+  loadCommands();
+}
+
+
+// ==============================
+// รายการคำสั่ง
+// ==============================
+function loadCommands() {
+
+  const groupIndex =
+    Number(categorySelect.value || 0);
+
+  const group =
+    commandGroups[groupIndex];
+
+
+  commandSelect.innerHTML = '';
+
+
+  if (!group) {
+    return;
+  }
+
+
+  group.commands.forEach(function(command, index) {
+
+    const option =
+      document.createElement('option');
+
+    option.value =
+      String(index);
+
+    option.textContent =
+      command.name;
+
+    commandSelect.appendChild(option);
+
+  });
+
+
+  renderCommand();
+}
+
+
+// ==============================
+// คำสั่งที่เลือก
+// ==============================
+function getSelectedCommand() {
+
+  const groupIndex =
+    Number(categorySelect.value || 0);
+
+  const commandIndex =
+    Number(commandSelect.value || 0);
+
+  const group =
+    commandGroups[groupIndex];
+
+
+  if (!group) {
+    return null;
+  }
+
+
+  return group.commands[commandIndex] || null;
+}
+
+
+// ==============================
+// Render Form
+// ==============================
+function renderCommand() {
+
+  const command =
+    getSelectedCommand();
+
+
+  fieldsContainer.innerHTML = '';
+  extraInfo.innerHTML = '';
+
+
+  if (!command) {
+
+    commandInfo.textContent =
+      'ไม่พบคำสั่ง';
+
+    previewText.textContent =
+      '-';
+
+    return;
+  }
+
+
+  commandInfo.innerHTML = '';
+
+
+  const nameEl =
+    document.createElement('div');
+
+  nameEl.className =
+    'command-name';
+
+  nameEl.textContent =
+    command.name;
+
+
+  const syntaxEl =
+    document.createElement('div');
+
+  syntaxEl.className =
+    'syntax';
+
+  syntaxEl.textContent =
+    'รูปแบบ: ' + command.syntax;
+
+
+  commandInfo.appendChild(nameEl);
+  commandInfo.appendChild(syntaxEl);
+
+
+  command.fields.forEach(function(field, index) {
+
+    const box =
+      document.createElement('div');
+
+    box.className =
+      'field-box';
+
+
+    const label =
+      document.createElement('label');
+
+    label.className =
+      'field-label';
+
+    label.textContent =
+      field.label;
+
+
+    const input =
+      document.createElement(
+        field.multiline
+          ? 'textarea'
+          : 'input'
+      );
+
+
+    input.id =
+      'command_field_' + index;
+
+
+    if (!field.multiline) {
+      input.type = 'text';
+    }
+
+
+    if (field.inputMode) {
+      input.inputMode =
+        field.inputMode;
+    }
+
+
+    input.placeholder =
+      field.placeholder || '';
+
+
+    input.dataset.sanitize =
+      field.sanitize || '';
+
+
+    input.addEventListener(
+      'input',
+      updatePreview
+    );
+
+
+    box.appendChild(label);
+    box.appendChild(input);
+
+    fieldsContainer.appendChild(box);
+
+  });
+
+
+  if (command.example) {
+
+    const el =
+      document.createElement('div');
+
+    el.className =
+      'example';
+
+    el.textContent =
+      'ตัวอย่าง: ' + command.example;
+
+    extraInfo.appendChild(el);
+
+  }
+
+
+  if (command.note) {
+
+    const el =
+      document.createElement('div');
+
+    el.className =
+      'note-box';
+
+    el.textContent =
+      'หมายเหตุ: ' + command.note;
+
+    extraInfo.appendChild(el);
+
+  }
+
+
+  updatePreview();
+}
+
+
+// ==============================
+// อ่านค่า Field
+// ==============================
+function getFieldValues(command) {
+
+  return command.fields.map(
+    function(field, index) {
+
+      const el =
+        document.getElementById(
+          'command_field_' + index
+        );
+
+
+      let value =
+        String(
+          el ? el.value : ''
+        ).trim();
+
+
+      if (
+        field.sanitize === 'digits'
+      ) {
+
+        value =
+          value.replace(/\\D/g, '');
+
+      }
+
+
+      return value;
+    }
+  );
+}
+
+
+// ==============================
+// สร้างคำสั่ง
+// ==============================
+function buildCommand() {
+
+  const command =
+    getSelectedCommand();
+
+
+  if (!command) {
+    return '';
+  }
+
+
+  if (!command.fields.length) {
+    return command.prefix;
+  }
+
+
+  const values =
+    getFieldValues(command);
+
+
+  return (
+    command.prefix +
+    values.join(
+      command.separator || ''
+    )
+  );
+}
+
+
+// ==============================
+// Preview
+// ==============================
+function updatePreview() {
+
+  const text =
+    buildCommand();
+
+  previewText.textContent =
+    text || '-';
+}
+
+
+// ==============================
+// STATUS
+// ==============================
+function showStatus(
+  text,
+  type
+) {
+
+  statusEl.className =
+    'status' +
+    (
+      type
+        ? ' ' + type
+        : ''
+    );
+
+  statusEl.textContent =
+    text;
+}
+
+
+// ==============================
+// เริ่ม LIFF
+// ==============================
+async function initLiff() {
+
+  try {
+
+    if (!LIFF_ID) {
+
+      throw new Error(
+        'ยังไม่ได้ตั้งค่า LIFF_ID'
+      );
+
+    }
+
+
+    await liff.init({
+      liffId: LIFF_ID
+    });
+
+
+    if (!liff.isLoggedIn()) {
+
+      liff.login();
+      return;
+
+    }
+
+
+    if (!liff.isInClient()) {
+
+      showStatus(
+        'กรุณาเปิด LIFF URL จากภายในแอป LINE',
+        'error'
+      );
+
+      return;
+    }
+
+
+    liffReady = true;
+
+    sendButton.disabled = false;
+
+
+    showStatus(
+      '✅ พร้อมใช้งาน',
+      'success'
+    );
+
+
+  } catch (err) {
+
+    console.error(
+      'LIFF INIT ERROR:',
+      err
+    );
+
+
+    showStatus(
+      'LIFF ERROR: ' +
+      (err.code || '') +
+      ' ' +
+      (err.message || err),
+      'error'
+    );
+
+  }
+
+}
+
+
+// ==============================
+// ส่งคำสั่ง
+// ==============================
+async function sendCommand() {
+
+  if (!liffReady) {
+
+    showStatus(
+      'LINE ยังไม่พร้อมใช้งาน',
+      'error'
+    );
+
+    return;
+  }
+
+
+  const command =
+    getSelectedCommand();
+
+
+  if (!command) {
+
+    showStatus(
+      'กรุณาเลือกคำสั่ง',
+      'error'
+    );
+
+    return;
+  }
+
+
+  const values =
+    getFieldValues(command);
+
+
+  if (
+    values.some(function(value) {
+      return !value;
+    })
+  ) {
+
+    showStatus(
+      'กรุณากรอกข้อมูลให้ครบทุกช่อง',
+      'error'
+    );
+
+    return;
+  }
+
+
+  const text =
+    buildCommand();
+
+
+  if (!text) {
+
+    showStatus(
+      'ไม่สามารถสร้างคำสั่งได้',
+      'error'
+    );
+
+    return;
+  }
+
+
+  try {
+
+    sendButton.disabled = true;
+
+
+    showStatus(
+      'กำลังส่งคำค้น...',
+      ''
+    );
+
+
+    await liff.sendMessages([
+      {
+        type: 'text',
+        text: text
+      }
+    ]);
+
+
+    showStatus(
+      '✅ ส่งคำค้นเรียบร้อยแล้ว',
+      'success'
+    );
+
+
+    setTimeout(
+      function() {
+
+        if (liff.isInClient()) {
+          liff.closeWindow();
+        }
+
+      },
+      800
+    );
+
+
+  } catch (err) {
+
+    console.error(
+      'SEND MESSAGE ERROR:',
+      err
+    );
+
+
+    sendButton.disabled = false;
+
+
+    showStatus(
+      '❌ ไม่สามารถส่งคำค้นได้: ' +
+      (err.message || err),
+      'error'
+    );
+
+  }
+
+}
+
+
+// ==============================
+// EVENT
+// ==============================
+categorySelect.addEventListener(
+  'change',
+  loadCommands
+);
+
+commandSelect.addEventListener(
+  'change',
+  renderCommand
+);
+
+sendButton.addEventListener(
+  'click',
+  sendCommand
+);
+
+
+// เริ่มหน้า
+loadCategories();
+initLiff();
+
+</script>
+
+</body>
+
+</html>
+  `);
+
+});
+
+// =====================================
+// LIFF WELFARE
+// =====================================
+app.get('/liff/welfare', (req, res) => {
+
+  const WELFARE_LIFF_ID =
+    process.env.WELFARE_LIFF_ID || '';
+
+  return res.send(`
+<!DOCTYPE html>
+
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>ตรวจสอบสถานะสวัสดิการ</title>
+
+<script
+  charset="utf-8"
+  src="https://static.line-scdn.net/liff/edge/2/sdk.js"
+></script>
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+
+  min-height: 100vh;
+
+  background: #070b11;
+  color: #ffffff;
+
+  font-family:
+    Arial,
+    Tahoma,
+    sans-serif;
+
+  display: flex;
+
+  align-items: center;
+  justify-content: center;
+
+  padding: 20px;
+
+  text-align: center;
+}
+
+.box {
+  width: 100%;
+  max-width: 420px;
+
+  background: #10161f;
+
+  border: 1px solid #293747;
+  border-radius: 20px;
+
+  padding: 30px 20px;
+}
+
+.icon {
+  font-size: 42px;
+}
+
+.title {
+  margin-top: 12px;
+
+  font-size: 18px;
+  font-weight: bold;
+}
+
+.status {
+  margin-top: 10px;
+
+  color: #94a3b8;
+
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.error {
+  color: #f87171;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+<div class="box">
+
+  <div class="icon">
+    🏛️
+  </div>
+
+  <div class="title">
+    ตรวจสอบสถานะสวัสดิการ
+  </div>
+
+  <div
+    id="status"
+    class="status"
+  >
+    กำลังเชื่อมต่อระบบ...
+  </div>
+
+</div>
+
+
+<script>
+
+const LIFF_ID =
+  ${JSON.stringify(WELFARE_LIFF_ID)};
+
+const TARGET_URL =
+  'https://welfare2.mof.go.th/welfare-customer-web/check-status';
+
+
+async function startWelfare() {
+
+  const statusEl =
+    document.getElementById('status');
+
+  try {
+
+    if (!LIFF_ID) {
+
+      throw new Error(
+        'ยังไม่ได้ตั้งค่า WELFARE_LIFF_ID'
+      );
+
+    }
+
+
+    await liff.init({
+      liffId: LIFF_ID
+    });
+
+
+    statusEl.textContent =
+      'กำลังเปิดระบบตรวจสอบสถานะ...';
+
+
+    // เปลี่ยน URL หลัง LIFF init สำเร็จแล้ว
+    window.location.replace(
+      TARGET_URL
+    );
+
+
+  } catch (err) {
+
+    console.error(
+      'WELFARE LIFF ERROR:',
+      err
+    );
+
+
+    statusEl.className =
+      'status error';
+
+
+    statusEl.textContent =
+      'LIFF ERROR: ' +
+      (err.code || '') +
+      ' ' +
+      (err.message || err);
+
+  }
+
+}
+
+
+startWelfare();
+
+</script>
+
+
+</body>
+
+</html>
+  `);
+
 });
 
 app.post('/webhook', line.middleware(config), async (req, res) => {
@@ -331,7 +14653,8 @@ processedEvents:{},
 topups:{},
 dtacPermissions:{},
 dtacBlocked:{},
-siBlocked:{}
+siBlocked:{},
+tBlocked:{}
 };
 
 }
@@ -343,7 +14666,13 @@ function saveDB(db) {
   if (!db.dtacPermissions) db.dtacPermissions = {};
   if (!db.dtacBlocked) db.dtacBlocked = {};
   if (!db.siBlocked) db.siBlocked = {};
-  fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2), 'utf8');
+  if (!db.tBlocked) db.tBlocked = {};
+
+  fs.writeFileSync(
+    DATA_FILE,
+    JSON.stringify(db, null, 2),
+    'utf8'
+  );
 }
 
 function nowThai() {
@@ -396,6 +14725,238 @@ function formatThaiDateOnly(date) {
   });
 }
 
+function formatSearchDateTimeThai(
+  date = new Date()
+) {
+
+  const parts =
+    new Intl.DateTimeFormat(
+      'th-TH',
+      {
+        timeZone: 'Asia/Bangkok',
+
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+
+        hour12: false
+      }
+    ).formatToParts(date);
+
+
+  const get =
+    type =>
+      parts.find(
+        item => item.type === type
+      )?.value || '';
+
+
+  return (
+    `${get('day')}.` +
+    `${get('month')}.` +
+    `${get('year')} ` +
+    `${get('hour')}:` +
+    `${get('minute')}:` +
+    `${get('second')}`
+  );
+}
+
+
+function buildTrueSearchAudit(member) {
+
+  const lineName =
+    member?.lineName ||
+    member?.displayName ||
+    '-';
+
+
+  const phone =
+    member?.phone ||
+    member?.tel ||
+    member?.mobile ||
+    '-';
+
+
+  const fullName =
+    member?.fullname ||
+    member?.fullName ||
+    [
+      member?.firstName,
+      member?.lastName
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .trim() ||
+    '-';
+
+
+  return (
+`🔎สมาชิกผู้สืบค้น
+LINE : ${lineName}
+เบอร์ : ${phone}
+ชื่อผู้ค้น : ${fullName}
+วันเวลาสืบค้น : ${formatSearchDateTimeThai()}`
+  );
+}
+
+function addSearchAudit(message, member) {
+
+  if (!message) {
+    return message;
+  }
+
+
+  const auditMessage = {
+    type: 'text',
+    text: buildTrueSearchAudit(member)
+  };
+
+
+  // ======================================
+  // กรณีเดิมเป็นหลาย Message
+  // ======================================
+  if (Array.isArray(message)) {
+
+    const messages =
+      [...message];
+
+
+    // ป้องกัน Audit ซ้ำ
+    const alreadyHasAudit =
+      messages.some(item =>
+        item?.type === 'text' &&
+        String(item.text || '')
+          .includes(
+            '🔎สมาชิกผู้สืบค้น'
+          )
+      );
+
+
+    if (alreadyHasAudit) {
+      return messages;
+    }
+
+
+    // LINE ตอบได้สูงสุด 5 messages
+    // ถ้ายังไม่ถึง 5 ให้ Audit เป็นอีกข้อความ
+    if (messages.length < 5) {
+
+      messages.push(
+        auditMessage
+      );
+
+      return messages;
+    }
+
+
+    // ถ้ามีครบ 5 อยู่แล้ว
+    // ไม่สามารถส่งข้อความที่ 6 ได้
+    // จึงเอา Audit ไปต่อใน Text ตัวสุดท้ายแทน
+    for (
+      let i = messages.length - 1;
+      i >= 0;
+      i--
+    ) {
+
+      if (
+        messages[i]?.type === 'text'
+      ) {
+
+        const oldText =
+          String(
+            messages[i].text || ''
+          ).trimEnd();
+
+
+        messages[i] = {
+          ...messages[i],
+
+          text:
+`${oldText}
+
+-  -  -  -  -  -  -  -
+${auditMessage.text}`
+        };
+
+
+        return messages;
+      }
+    }
+
+
+    return messages;
+  }
+
+
+  // ======================================
+  // ถ้าข้อความเดิมมี Audit อยู่แล้ว
+  // ======================================
+  if (
+    message?.type === 'text' &&
+    String(message.text || '')
+      .includes(
+        '🔎สมาชิกผู้สืบค้น'
+      )
+  ) {
+
+    return message;
+  }
+
+
+  // ======================================
+  // Text / Flex / Image ฯลฯ
+  // ให้ Audit เด้งเป็น Message ที่ 2
+  // ======================================
+  return [
+    message,
+    auditMessage
+  ];
+}
+
+const SEARCH_AUDIT_CONTEXT =
+  new Map();
+
+
+const SEARCH_AUDIT_COMMANDS = [
+  't#',
+  'd#',
+  'f#',
+  'bq%',
+  'se%',
+  'si%',
+  'car#',
+  'cid#',
+  'doc#',
+  'c#',
+  'psi#',
+  'ps#',
+  'atm%',
+  'bn%',
+  'dl#',
+  'sc%'
+];
+
+
+function shouldAddSearchAudit(text) {
+
+  const value =
+    String(text || '')
+      .trim()
+      .toLowerCase();
+
+
+  return SEARCH_AUDIT_COMMANDS.some(
+    command =>
+      value.startsWith(
+        command.toLowerCase()
+      )
+  );
+}
+
 function safeVehicleValue(value, fallback = 'ไม่ระบุ') {
   if (value === null || value === undefined) return fallback;
   const text = String(value).trim();
@@ -418,16 +14979,26 @@ function getVehicleColor(vehicle) {
 }
 
 function formatVehicleDetails(vehicle, index) {
-  const owner2Block = vehicle?.docNo2 || vehicle?.owner2 || vehicle?.addressOwner2
-    ? `\n🙍ผู้ครอบครอง:\nเลขประจำตัว: ${safeVehicleValue(vehicle?.docNo2)}\nชื่อ: ${safeVehicleValue(vehicle?.owner2)}\nที่อยู่: ${normalizeVehicleAddress(vehicle?.addressOwner2)}`
-    : '';
+  const owner2Block =
+    vehicle?.docNo2 || vehicle?.owner2 || vehicle?.addressOwner2
+      ? `\n👤ผู้ครอบครอง
+┌●ID: ${safeVehicleValue(vehicle?.docNo2)}
+├●ชื่อ: ${safeVehicleValue(vehicle?.owner2)}
+└●ที่อยู่: ${normalizeVehicleAddress(vehicle?.addressOwner2)}`
+      : '';
+
   const noteBlock = vehicle?.note
-    ? `\n📝 หมายเหตุ: ${safeVehicleValue(vehicle.note)}${vehicle.noteDate ? ` (${formatThaiDateOnly(vehicle.noteDate)})` : ''}`
+    ? `\n📝 หมายเหตุ: ${safeVehicleValue(vehicle.note)}${
+        vehicle.noteDate
+          ? ` (${formatThaiDateOnly(vehicle.noteDate)})`
+          : ''
+      }`
     : '';
 
-  return `\n┌●รถคันที่${index}
+  return `
+┌●คันที่${index}🚗
 ├●ทะเบียน: ${safeVehicleValue(vehicle?.plate1, '')}${safeVehicleValue(vehicle?.plate2, '')}
-├●สำนักงาน: ${safeVehicleValue(vehicle?.offLocDesc)}
+├●จังหวัด: ${safeVehicleValue(vehicle?.offLocDesc)}
 ├●ยี่ห้อ: ${safeVehicleValue(vehicle?.brnDesc)}
 ├●รุ่น: ${safeVehicleValue(vehicle?.modelName)}
 ├●สี: ${getVehicleColor(vehicle)}
@@ -440,12 +15011,305 @@ function formatVehicleDetails(vehicle, index) {
 ├●เชื้อเพลิง: ${safeVehicleValue(vehicle?.fuelDesc)}
 ├●วันที่จดทะเบียน: ${formatThaiDateOnly(vehicle?.regDate)}
 └●วันที่หมดอายุ: ${formatThaiDateOnly(vehicle?.expDate)}
-👤ข้อมูลเจ้าของ
-┌●ผู้ถือกรรมสิทธิ์:
-├●เลขประจำตัว: ${safeVehicleValue(vehicle?.docNo1)}
+👤ผู้ถือกรรมสิทธิ์
+┌●ID: ${safeVehicleValue(vehicle?.docNo1)}
 ├●ชื่อ: ${safeVehicleValue(vehicle?.owner1)}
-└●ที่อยู่: ${normalizeVehicleAddress(vehicle?.addressOwner1)}${owner2Block}${noteBlock}
--------------------`;
+└●ที่อยู่: ${normalizeVehicleAddress(vehicle?.addressOwner1)}${owner2Block}${noteBlock}`;
+}
+
+function formatVehicleDetailsFlex(vehicle, index) {
+
+  const sv = (value, fallback = '-') => {
+    if (value === null || value === undefined) return fallback;
+    const text = String(value).trim();
+    return text ? text : fallback;
+  };
+
+  const plate =
+    `${safeVehicleValue(vehicle?.plate1, '')}${safeVehicleValue(vehicle?.plate2, '')}` || '-';
+
+  const owner1Address =
+    normalizeVehicleAddress(vehicle?.addressOwner1) || '-';
+
+  const hasOwner2 =
+    vehicle?.docNo2 ||
+    vehicle?.owner2 ||
+    vehicle?.addressOwner2;
+
+  // =========================
+  // BODY
+  // =========================
+
+  const bodyContents = [
+
+    // ข้อมูลรถ
+    {
+      type: 'text',
+      text: '🚗 ข้อมูลรถ',
+      weight: 'bold',
+      size: 'lg',
+      color: '#0F172A'
+    },
+
+    {
+      type: 'text',
+      text:
+        `ทะเบียน: ${plate}\n` +
+        `จังหวัด: ${safeVehicleValue(vehicle?.offLocDesc)}\n` +
+        `ยี่ห้อ: ${safeVehicleValue(vehicle?.brnDesc)}\n` +
+        `รุ่น: ${safeVehicleValue(vehicle?.modelName)}\n` +
+        `สี: ${getVehicleColor(vehicle)}\n` +
+        `ประเภทรถ: ${safeVehicleValue(vehicle?.vehTypeDesc)}\n` +
+        `ลักษณะรถ: ${safeVehicleValue(vehicle?.kindDesc)}`,
+      wrap: true,
+      size: 'sm',
+      color: '#334155',
+      margin: 'md'
+    },
+
+    {
+      type: 'separator',
+      margin: 'lg'
+    },
+
+    // สถานะรถ
+    {
+      type: 'text',
+      text: '📋 สถานะและทะเบียน',
+      weight: 'bold',
+      size: 'md',
+      color: '#0F172A',
+      margin: 'lg'
+    },
+
+    {
+      type: 'text',
+      text:
+        `สถานะรถ: ${safeVehicleValue(vehicle?.carStatus)}\n` +
+        `อายัด/ถือครอง: ${safeVehicleValue(vehicle?.holdFlag)}\n` +
+        `เลขตัวถัง: ${safeVehicleValue(vehicle?.numBody)}\n` +
+        `เลขเครื่อง: ${safeVehicleValue(vehicle?.numEng)}\n` +
+        `เชื้อเพลิง: ${safeVehicleValue(vehicle?.fuelDesc)}\n` +
+        `วันที่จดทะเบียน: ${formatThaiDateOnly(vehicle?.regDate)}\n` +
+        `วันที่หมดอายุ: ${formatThaiDateOnly(vehicle?.expDate)}`,
+      wrap: true,
+      size: 'sm',
+      color: '#334155'
+    },
+
+    {
+      type: 'separator',
+      margin: 'lg'
+    },
+
+    // ผู้ถือกรรมสิทธิ์
+    {
+      type: 'text',
+      text: '👤 ผู้ถือกรรมสิทธิ์',
+      weight: 'bold',
+      size: 'md',
+      color: '#0F172A',
+      margin: 'lg'
+    },
+
+    {
+      type: 'text',
+      text:
+        `ID: ${safeVehicleValue(vehicle?.docNo1)}\n` +
+        `ชื่อ: ${safeVehicleValue(vehicle?.owner1)}\n` +
+        `ที่อยู่: ${owner1Address}`,
+      wrap: true,
+      size: 'sm',
+      color: '#334155'
+    }
+  ];
+
+  // =========================
+  // ผู้ครอบครอง
+  // =========================
+
+  if (hasOwner2) {
+
+    bodyContents.push(
+      {
+        type: 'separator',
+        margin: 'lg'
+      },
+
+      {
+        type: 'text',
+        text: '👤 ผู้ครอบครอง',
+        weight: 'bold',
+        size: 'md',
+        color: '#0F172A',
+        margin: 'lg'
+      },
+
+      {
+        type: 'text',
+        text:
+          `ID: ${safeVehicleValue(vehicle?.docNo2)}\n` +
+          `ชื่อ: ${safeVehicleValue(vehicle?.owner2)}\n` +
+          `ที่อยู่: ${normalizeVehicleAddress(vehicle?.addressOwner2)}`,
+        wrap: true,
+        size: 'sm',
+        color: '#334155'
+      }
+    );
+  }
+
+  // =========================
+  // หมายเหตุ
+  // =========================
+
+  if (vehicle?.note) {
+
+    bodyContents.push(
+      {
+        type: 'separator',
+        margin: 'lg'
+      },
+
+      {
+        type: 'text',
+        text: '📝 หมายเหตุ',
+        weight: 'bold',
+        size: 'md',
+        color: '#B91C1C',
+        margin: 'lg'
+      },
+
+      {
+        type: 'text',
+        text:
+          `${safeVehicleValue(vehicle.note)}` +
+          (
+            vehicle.noteDate
+              ? `\nวันที่: ${formatThaiDateOnly(vehicle.noteDate)}`
+              : ''
+          ),
+        wrap: true,
+        size: 'sm',
+        color: '#7F1D1D'
+      }
+    );
+  }
+
+  // =========================
+  // ข้อความสำหรับปุ่มคัดลอก
+  // =========================
+
+  let copyText =
+    `🚗 ข้อมูลรถคันที่ ${index}\n` +
+    `ทะเบียน: ${plate}\n` +
+    `จังหวัด: ${safeVehicleValue(vehicle?.offLocDesc)}\n` +
+    `ยี่ห้อ: ${safeVehicleValue(vehicle?.brnDesc)}\n` +
+    `รุ่น: ${safeVehicleValue(vehicle?.modelName)}\n` +
+    `สี: ${getVehicleColor(vehicle)}\n` +
+    `ประเภทรถ: ${safeVehicleValue(vehicle?.vehTypeDesc)}\n` +
+    `ลักษณะรถ: ${safeVehicleValue(vehicle?.kindDesc)}\n` +
+    `สถานะรถ: ${safeVehicleValue(vehicle?.carStatus)}\n` +
+    `อายัด/ถือครอง: ${safeVehicleValue(vehicle?.holdFlag)}\n` +
+    `เลขตัวถัง: ${safeVehicleValue(vehicle?.numBody)}\n` +
+    `เลขเครื่อง: ${safeVehicleValue(vehicle?.numEng)}\n` +
+    `เชื้อเพลิง: ${safeVehicleValue(vehicle?.fuelDesc)}\n` +
+    `วันที่จดทะเบียน: ${formatThaiDateOnly(vehicle?.regDate)}\n` +
+    `วันที่หมดอายุ: ${formatThaiDateOnly(vehicle?.expDate)}\n\n` +
+
+    `👤 ผู้ถือกรรมสิทธิ์\n` +
+    `ID: ${safeVehicleValue(vehicle?.docNo1)}\n` +
+    `ชื่อ: ${safeVehicleValue(vehicle?.owner1)}\n` +
+    `ที่อยู่: ${owner1Address}`;
+
+  if (hasOwner2) {
+    copyText +=
+      `\n\n👤 ผู้ครอบครอง\n` +
+      `ID: ${safeVehicleValue(vehicle?.docNo2)}\n` +
+      `ชื่อ: ${safeVehicleValue(vehicle?.owner2)}\n` +
+      `ที่อยู่: ${normalizeVehicleAddress(vehicle?.addressOwner2)}`;
+  }
+
+  if (vehicle?.note) {
+    copyText +=
+      `\n\n📝 หมายเหตุ: ${safeVehicleValue(vehicle.note)}`;
+
+    if (vehicle.noteDate) {
+      copyText +=
+        ` (${formatThaiDateOnly(vehicle.noteDate)})`;
+    }
+  }
+
+  // =========================
+  // BUBBLE
+  // =========================
+
+  return {
+    type: 'bubble',
+    size: 'mega',
+
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      backgroundColor: '#0F172A',
+      paddingAll: '18px',
+
+      contents: [
+        {
+          type: 'text',
+          text: `🚗 รถคันที่ ${index}`,
+          weight: 'bold',
+          size: 'xl',
+          color: '#FFFFFF'
+        },
+
+        {
+          type: 'text',
+          text: plate,
+          weight: 'bold',
+          size: 'lg',
+          color: '#FACC15',
+          margin: 'sm'
+        },
+
+        {
+          type: 'text',
+          text: safeVehicleValue(vehicle?.offLocDesc),
+          size: 'sm',
+          color: '#CBD5E1',
+          margin: 'xs'
+        }
+      ]
+    },
+
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '18px',
+      spacing: 'sm',
+      contents: bodyContents
+    },
+
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '16px',
+
+      contents: [
+        {
+          type: 'button',
+          style: 'primary',
+          height: 'sm',
+          color: '#0F172A',
+
+          action: {
+            type: 'clipboard',
+            label: 'คัดลอกข้อมูล',
+            clipboardText: copyText
+          }
+        }
+      ]
+    }
+  };
 }
 
 function addDaysFromNow(days) {
@@ -494,7 +15358,44 @@ function isEventProcessed(db, eventId) {
 }
 
 async function reply(replyToken, messages) {
-  const arr = Array.isArray(messages) ? messages : [messages];
+
+  let finalMessages = messages;
+
+
+  // =====================================
+  // SEARCH AUDIT อัตโนมัติ
+  // =====================================
+  const auditMember =
+    SEARCH_AUDIT_CONTEXT.get(
+      replyToken
+    );
+
+
+  if (auditMember) {
+
+    finalMessages =
+      addSearchAudit(
+        finalMessages,
+        auditMember
+      );
+
+
+    // ใช้แล้วลบทิ้งทันที
+    SEARCH_AUDIT_CONTEXT.delete(
+      replyToken
+    );
+  }
+
+
+  // =====================================
+  // แปลงเป็น Array สำหรับ LINE
+  // =====================================
+  const arr =
+    Array.isArray(finalMessages)
+      ? finalMessages
+      : [finalMessages];
+
+
   return client.replyMessage({
     replyToken,
     messages: arr
@@ -589,6 +15490,357 @@ async function fetchInstallment(nationId) {
   );
 
   return resp.data;
+}
+
+async function fetchSiamInstallment(nationId) {
+  const url =
+    `${DXC_BACKUP_API_BASE}?siam=${encodeURIComponent(nationId)}&key=${encodeURIComponent(SEARCH_API_KEY)}`;
+
+  const resp = await axios.get(url, {
+    headers: {
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
+    },
+    timeout: 30000
+  });
+
+  return resp.data;
+}
+
+function splitSiamAddress(address) {
+  const text = String(address || '')
+    .replace(/ตำบล/g, 'ต.')
+    .replace(/อำเภอ/g, 'อ.')
+    .replace(/จังหวัด/g, 'จ.')
+    .trim();
+
+  if (!text || text === '-') return ['-'];
+
+  const tambonIndex = text.indexOf('ต.');
+  const changwatIndex = text.indexOf('จ.');
+
+  if (tambonIndex > 0 && changwatIndex > tambonIndex) {
+    return [
+      text.slice(0, tambonIndex).trim(),
+      text.slice(tambonIndex, changwatIndex).trim(),
+      text.slice(changwatIndex).trim()
+    ];
+  }
+
+  if (tambonIndex > 0) {
+    return [
+      text.slice(0, tambonIndex).trim(),
+      text.slice(tambonIndex).trim()
+    ];
+  }
+
+  return [text];
+}
+
+function formatSiamInstallment(data, pid) {
+  if (!data || data.success !== true || !data.data) {
+    return `❌ ไม่พบข้อมูลการผ่อนสินค้าสำหรับเลขบัตร ${pid}`;
+  }
+
+  const { hirer = {}, installment_history = [] } = data.data;
+
+  if (!Array.isArray(installment_history) || installment_history.length === 0) {
+    return '📋 ประวัติการผ่อนสินค้า\n\n❌ ไม่พบประวัติการผ่อนสินค้า';
+  }
+
+  const sv = (value, fallback = '-') => {
+    if (value === null || value === undefined) return fallback;
+    const text = String(value).trim();
+    return text ? text : fallback;
+  };
+
+  const lines = ['📋 ประวัติการผ่อนสินค้า', '│'];
+
+  lines.push('├ 👤 ข้อมูลผู้เช่าซื้อ');
+  lines.push(`│  Name: ${sv(hirer.name)}`);
+  lines.push(`│  ID: ${sv(hirer.id, pid)}`);
+  lines.push('│');
+
+  installment_history.forEach((item, index) => {
+    const isLast = index === installment_history.length - 1;
+    const branch = isLast ? '└' : '├';
+    const guarantor = item.guarantor || {};
+
+    lines.push(`${branch} 🛍️ ประวัติผ่อนสินค้า ลำดับที่ ${sv(item.seq, index + 1)}`);
+    lines.push(`│  วันที่ขาย: ${sv(item.sale_date)}`);
+    lines.push(`│  วันที่เริ่มสัญญา: ${sv(item.contract_start_date)}`);
+    lines.push(`│  วันที่งวดสุดท้าย: ${sv(item.last_installment_date)}`);
+    lines.push(`│  ผู้เช่าซื้อ: ${sv(item.hirer)}`);
+    lines.push(`│  เบอร์: ${sv(item.phone)}`);
+    lines.push(`│  เบอร์อื่น: ${sv(item.other_phone)}`);
+    lines.push('│');
+    lines.push(`${branch} 📍 ที่อยู่ปัจจุบัน / ที่อยู่ลงสินค้า`);
+
+    splitSiamAddress(item.current_address).forEach((addrLine) => {
+      lines.push(`│  ${addrLine}`);
+    });
+
+    lines.push('│');
+    lines.push(`${branch} 🤝 ข้อมูลผู้ค้ำประกัน`);
+    lines.push(`ผู้ค้ำ: ${sv(guarantor.name)}`);
+    lines.push(`ID: ${sv(guarantor.id)}`);
+    lines.push(`เบอร์: ${sv(guarantor.phone)}`);
+    lines.push(`ความสัมพันธ์: ${sv(guarantor.relationship)}`);
+
+    if (!isLast) lines.push('│');
+  });
+
+  return limitLineMessage(lines.join('\n'));
+}
+
+function formatSiamInstallmentFlex(data, pid) {
+  if (!data || data.success !== true || !data.data) {
+    return {
+      type: 'text',
+      text: `❌ ไม่พบข้อมูลการผ่อนสินค้าสำหรับเลขบัตร ${pid}`
+    };
+  }
+
+  const {
+    hirer = {},
+    installment_history = []
+  } = data.data;
+
+  if (
+    !Array.isArray(installment_history) ||
+    installment_history.length === 0
+  ) {
+    return {
+      type: 'text',
+      text: '📋 ประวัติการผ่อนสินค้า\n\n❌ ไม่พบประวัติการผ่อนสินค้า'
+    };
+  }
+
+  const sv = (value, fallback = '-') => {
+    if (value === null || value === undefined) return fallback;
+
+    const text = String(value).trim();
+
+    return text ? text : fallback;
+  };
+
+  const bubbles = installment_history
+    .slice(0, 10)
+    .map((item, index) => {
+
+      const guarantor = item.guarantor || {};
+
+      const addressLines =
+        splitSiamAddress(item.current_address);
+
+      const addressText =
+        Array.isArray(addressLines) && addressLines.length
+          ? addressLines.join('\n')
+          : '-';
+
+      return {
+        type: 'bubble',
+        size: 'mega',
+
+        header: {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: '#0F172A',
+          paddingAll: '18px',
+
+          contents: [
+            {
+              type: 'text',
+              text: `🛍️ ประวัติผ่อนสินค้า ${index + 1}`,
+              color: '#FFFFFF',
+              weight: 'bold',
+              size: 'lg'
+            },
+            {
+              type: 'text',
+              text: `ลำดับที่ ${sv(item.seq, index + 1)}`,
+              color: '#CBD5E1',
+              size: 'sm',
+              margin: 'sm'
+            }
+          ]
+        },
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          paddingAll: '18px',
+          spacing: 'md',
+
+          contents: [
+
+            // =========================
+            // ผู้เช่าซื้อ
+            // =========================
+            {
+              type: 'text',
+              text: '👤 ข้อมูลผู้เช่าซื้อ',
+              weight: 'bold',
+              size: 'md',
+              color: '#0F172A'
+            },
+
+            {
+              type: 'text',
+              text:
+                `ชื่อ: ${sv(item.hirer || hirer.name)}\n` +
+                `ID: ${sv(hirer.id, pid)}\n` +
+                `เบอร์: ${sv(item.phone)}\n` +
+                `เบอร์อื่น: ${sv(item.other_phone)}`,
+              wrap: true,
+              size: 'sm',
+              color: '#334155'
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // =========================
+            // สัญญา
+            // =========================
+            {
+              type: 'text',
+              text: '📄 ข้อมูลสัญญา',
+              weight: 'bold',
+              size: 'md',
+              color: '#0F172A',
+              margin: 'md'
+            },
+
+            {
+              type: 'text',
+              text:
+                `วันที่ขาย: ${sv(item.sale_date)}\n` +
+                `วันที่เริ่มสัญญา: ${sv(item.contract_start_date)}\n` +
+                `วันที่งวดสุดท้าย: ${sv(item.last_installment_date)}`,
+              wrap: true,
+              size: 'sm',
+              color: '#334155'
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // =========================
+            // ที่อยู่
+            // =========================
+            {
+              type: 'text',
+              text: '📍 ที่อยู่ปัจจุบัน / ที่อยู่ลงสินค้า',
+              weight: 'bold',
+              size: 'md',
+              color: '#0F172A',
+              margin: 'md',
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: addressText,
+              wrap: true,
+              size: 'sm',
+              color: '#334155'
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // =========================
+            // ผู้ค้ำ
+            // =========================
+            {
+              type: 'text',
+              text: '🤝 ข้อมูลผู้ค้ำประกัน',
+              weight: 'bold',
+              size: 'md',
+              color: '#0F172A',
+              margin: 'md'
+            },
+
+            {
+  type: 'text',
+  text:
+    `ผู้ค้ำ: ${sv(guarantor.name)}\n` +
+    `ID: ${sv(guarantor.id)}\n` +
+    `เบอร์: ${sv(guarantor.phone)}\n` +
+    `ความสัมพันธ์: ${sv(guarantor.relationship)}`,
+  wrap: true,
+  size: 'sm',
+  color: '#334155'
+}
+          ]
+        },
+
+        // =========================
+        // ปุ่มคัดลอกข้อมูล
+        // =========================
+        footer: {
+          type: 'box',
+          layout: 'vertical',
+          paddingAll: '16px',
+
+          contents: [
+            {
+              type: 'button',
+              style: 'primary',
+              height: 'sm',
+              color: '#0F172A',
+
+              action: {
+                type: 'clipboard',
+                label: 'คัดลอกข้อมูล',
+
+                clipboardText:
+                  `🛍️ ประวัติผ่อนสินค้า ${index + 1}\n` +
+                  `ลำดับที่: ${sv(item.seq, index + 1)}\n\n` +
+
+                  `👤 ข้อมูลผู้เช่าซื้อ\n` +
+                  `ชื่อ: ${sv(item.hirer || hirer.name)}\n` +
+                  `ID: ${sv(hirer.id, pid)}\n` +
+                  `เบอร์: ${sv(item.phone)}\n` +
+                  `เบอร์อื่น: ${sv(item.other_phone)}\n\n` +
+
+                  `📄 ข้อมูลสัญญา\n` +
+                  `วันที่ขาย: ${sv(item.sale_date)}\n` +
+                  `วันที่เริ่มสัญญา: ${sv(item.contract_start_date)}\n` +
+                  `วันที่งวดสุดท้าย: ${sv(item.last_installment_date)}\n\n` +
+
+                  `📍 ที่อยู่ปัจจุบัน / ที่อยู่ลงสินค้า\n` +
+                  `${addressText}\n\n` +
+
+                  `🤝 ข้อมูลผู้ค้ำประกัน\n` +
+                  `ผู้ค้ำ: ${sv(guarantor.name)}\n` +
+                  `ID: ${sv(guarantor.id)}\n` +
+                  `เบอร์: ${sv(guarantor.phone)}\n` +
+                  `ความสัมพันธ์: ${sv(guarantor.relationship)}`
+              }
+            }
+          ]
+        }
+      };
+    });
+
+  return {
+    type: 'flex',
+    altText: `ประวัติการผ่อนสินค้า ${installment_history.length} รายการ`,
+
+    contents: {
+      type: 'carousel',
+      contents: bubbles
+    }
+  };
 }
 
 async function fetchCrime(nationId) {
@@ -710,9 +15962,81 @@ const works = addresses.filter(a =>
 }
 
 function formatDtacSearch(res, query) {
-  const result = res?.data?.data?.body?.result || res?.data?.body?.result || res?.body?.result || res?.result;
+  const result = res?.data?.data?.data?.body?.result ||
+    res?.data?.data?.body?.result || res?.data?.body?.result ||
+    res?.body?.result || res?.result;
   if (!result) {
     return '❌ ไม่พบข้อมูล';
+  }
+
+  // New DTAC API schema (data.body.result.data/detail).
+  if (result.data || result.detail) {
+    const d = result.data || {};
+    const detail = result.detail || {};
+    const subscriberList = Array.isArray(d.listSubscriberByID)
+      ? d.listSubscriberByID
+      : [];
+
+    // ID-search response: subscriber details are nested in listSubscriberByID.
+    if (subscriberList.length) {
+      let msg = `📂[ ${query} ] [DTAC]\n`;
+      msg += `🪪 ID: ${detail.idCheck?.idNumber || query}\n`;
+      msg += `📱 เบอร์ที่พบ: ${subscriberList.length} รายการ\n\n`;
+      msg += subscriberList.map((item, index) => {
+        const subscriber = item?.subscriber || {};
+        const name = [subscriber.firstname, subscriber.lastname]
+          .filter(Boolean).join(' ') || '-';
+        const status = String(subscriber.status || '').toUpperCase() === 'A'
+          ? '✅ Active'
+          : (subscriber.status || '-');
+        return `${index + 1}. ${subscriber.subscriberNumber || '-'}\n` +
+          `   ชื่อ: ${name}\n` +
+          `   ประเภท: ${subscriber.telephoneType || '-'}\n` +
+          `   อายุการใช้งาน: ${subscriber.aouText || '-'}\n` +
+          `   สถานะ: ${status}\n` +
+          `   วันหมดสัญญา: ${item.contractEndDay ?? 0} วัน`;
+      }).join('\n\n');
+
+      const blackList = detail.idCheck?.blackListTrue || [];
+      if (blackList.length) {
+        msg += `\n\n⛔ Blacklist: ${blackList.map(item =>
+          `${item.banType || '-'} (${(item.banId || []).join(', ') || '-'})`
+        ).join(', ')}`;
+      }
+      return msg.trim();
+    }
+
+    const customerInfo = detail.customerInfo || {};
+    const nbtc = detail.nbtc || {};
+    const deviceItems = (detail.deviceSim?.deviceSIM || [])
+      .map(item => typeof item === 'string' ? item : item?.value)
+      .filter(Boolean);
+    const name = [d.customerTitle, d.customerFirstName, d.customerLastName]
+      .filter(Boolean).join(' ') || customerInfo.name || '-';
+    const type = /prepaid|เติมเงิน/i.test(`${d.subscriberType} ${d.fromPackageGroupType}`)
+      ? 'เติมเงิน' : 'รายเดือน';
+    const status = String(d.subscriberStatus || '').toUpperCase() === 'A' ? '✅ Active' : (d.subscriberStatus || '-');
+    const packageItems = Array.isArray(d.mainPackages) ? d.mainPackages : [];
+    const packageText = packageItems.length
+      ? packageItems.map(p => `└● ${p.description || '-'}`).join('\n')
+      : '└● ไม่พบแพ็กเกจหลัก';
+    const startDate = d.switchOnDate ? d.switchOnDate.split('-').reverse().join('/') : '-';
+    let msg = `📘[ ${query} ] [DTAC]\n`;
+    msg += `👤 Name: ${name}\n`;
+    msg += `🪪 ID: ${d.customerIDNumber || detail.idCheck?.idNumber || '-'}\n\n`;
+    msg += `┌● เลขสมาชิก: ${d.customerNumber || d.subscriberNumber || '-'}\n`;
+    msg += `├● สถานะระบบ: ${d.subscriberStatus || '-'}\n`;
+    msg += `└● กลุ่มลูกค้า: ${detail.segment?.segment || '-'}\n\n`;
+    msg += `📱 ข้อมูลซิม\n┌● ประเภท: ${type}\n`;
+    msg += `├● อายุการใช้งาน: ${d.aouText || '-'}\n`;
+    msg += `├● เปิดใช้งาน: ${d.switchOnDate || '-'}\n`;
+    msg += `└● สถานะ: ${status}\n\n`;
+    msg += `📦 Main Package\n${packageText}\n`;
+    if (packageItems[0]?.startDateTime) msg += `└● เริ่มใช้งาน: ${packageItems[0].startDateTime}\n`;
+    msg += `\n💳 SIM Number: ${d.simCardNumber || '-'}\n\n`;
+    msg += `✅ NBTC: ${nbtc.result || '-'}\n`;
+    if (deviceItems.length) msg += `\n📲 Device/Sim\n${deviceItems.map((v, i) => `${i === deviceItems.length - 1 ? '●' : '●'} ${v}`).join('\n')}`;
+    return msg.trim();
   }
 
   const userData = result.userData || {};
@@ -728,7 +16052,7 @@ function formatDtacSearch(res, query) {
 
   const sep = '-------------------';
 
-  let msg = `📘 INFO [${query}] [DTAC]\n${sep}\n`;
+  let msg = `📘 [${query}]\n${sep}\n`;
   msg += `ชื่อ-สกุล: ${userData.NameSurname || '-'}\n`;
   msg += `เลขบัตร: ${userData.IDNumber || '-'}\n`;
 
@@ -758,7 +16082,7 @@ function formatDtacSearch(res, query) {
     msg += `┌●ประเภท: ${simData.type || '-'}\n`;
     msg += `├● ยอดเงินคงเหลือ: ${simData.Balance || '-'}\n`;
     msg += `├● วันหมดอายุ: ${simData.ExpireTime || '-'}\n`;
-    msg += `└● วันที่เปิดเบอร์: ${simData.StartDate || '-'}\n`;
+    msg += `└● วันเปิดเบอร์: ${simData.StartDate || '-'}\n`;
 
     if (deviceData.deviceSimList && deviceData.deviceSimList.length > 0) {
       msg += `\n📲 ข้อมูลอุปกรณ์/ซิม\n`;
@@ -777,6 +16101,543 @@ function formatDtacSearch(res, query) {
   }
 
   return msg.trim();
+}
+
+function formatDtacSearchFlex(res, query) {
+
+  const result =
+    res?.data?.data?.data?.body?.result ||
+    res?.data?.data?.body?.result ||
+    res?.data?.body?.result ||
+    res?.body?.result ||
+    res?.result;
+
+  if (!result) {
+    return {
+      type: 'text',
+      text: '❌ ไม่พบข้อมูล'
+    };
+  }
+
+  if (result.data || result.detail) {
+
+    const d = result.data || {};
+    const detail = result.detail || {};
+
+    const subscriberList =
+      Array.isArray(d.listSubscriberByID)
+        ? d.listSubscriberByID
+        : [];
+
+
+    // =====================================================
+    // CASE 1 : ค้นด้วยเลขบัตร 13 หลัก
+    // =====================================================
+
+    if (subscriberList.length) {
+
+      const blackList =
+        Array.isArray(detail.idCheck?.blackListTrue)
+          ? detail.idCheck.blackListTrue
+          : [];
+
+      const bubbles = subscriberList
+        .slice(0, 10)
+        .map((item, index) => {
+
+          const subscriber =
+            item?.subscriber || {};
+
+          const name = [
+            subscriber.firstname,
+            subscriber.lastname
+          ]
+            .filter(Boolean)
+            .join(' ') || '-';
+
+          const status =
+            String(subscriber.status || '').toUpperCase() === 'A'
+              ? '✅ Active'
+              : (subscriber.status || '-');
+
+          const rawNumber =
+            subscriber.subscriberNumber || '-';
+
+          // ถ้าเป็น 66xxxxxxxxx ให้แสดงเป็น 0xxxxxxxxx
+          const displayNumber =
+            /^66\d+$/.test(String(rawNumber))
+              ? `0${String(rawNumber).slice(2)}`
+              : rawNumber;
+
+          const blacklistText =
+            blackList.length
+              ? blackList.map(item => {
+                  const ids =
+                    Array.isArray(item.banId)
+                      ? item.banId.join(', ')
+                      : '-';
+
+                  return `${item.banType || '-'} (${ids || '-'})`;
+                }).join('\n')
+              : 'ไม่พบ';
+
+          return {
+            type: 'bubble',
+            size: 'mega',
+
+            header: {
+              type: 'box',
+              layout: 'vertical',
+              backgroundColor: '#0F172A',
+              paddingAll: '18px',
+
+              contents: [
+                {
+                  type: 'text',
+                  text: `📘 DTAC รายการ ${index + 1}`,
+                  color: '#FFFFFF',
+                  weight: 'bold',
+                  size: 'lg'
+                },
+
+                {
+                  type: 'text',
+                  text: displayNumber,
+                  color: '#38BDF8',
+                  weight: 'bold',
+                  size: 'xl',
+                  margin: 'sm'
+                }
+              ]
+            },
+
+            body: {
+              type: 'box',
+              layout: 'vertical',
+              paddingAll: '18px',
+              spacing: 'md',
+
+              contents: [
+
+                {
+                  type: 'text',
+                  text: '👤 ข้อมูลสมาชิก',
+                  weight: 'bold',
+                  size: 'md',
+                  color: '#0F172A'
+                },
+
+                {
+                  type: 'text',
+                  text:
+                    `ชื่อ: ${name}\n` +
+                    `ID: ${detail.idCheck?.idNumber || query}`,
+                  wrap: true,
+                  size: 'sm',
+                  color: '#334155'
+                },
+
+                {
+                  type: 'separator',
+                  margin: 'md'
+                },
+
+                {
+                  type: 'text',
+                  text: '📂 ข้อมูลหมายเลข',
+                  weight: 'bold',
+                  size: 'md',
+                  color: '#0F172A',
+                  margin: 'md'
+                },
+
+                {
+                  type: 'text',
+                  text:
+                    `หมายเลข: ${displayNumber}\n` +
+                    `ประเภท: ${subscriber.telephoneType || '-'}\n` +
+                    `อายุการใช้งาน: ${subscriber.aouText || '-'}\n` +
+                    `สถานะ: ${status}\n` +
+                    `วันหมดสัญญา: ${item.contractEndDay ?? 0} วัน`,
+                  wrap: true,
+                  size: 'sm',
+                  color: '#334155'
+                },
+
+                {
+                  type: 'separator',
+                  margin: 'md'
+                },
+
+                {
+                  type: 'text',
+                  text: '⛔ Blacklist',
+                  weight: 'bold',
+                  size: 'md',
+                  color: '#B91C1C',
+                  margin: 'md'
+                },
+
+                {
+                  type: 'text',
+                  text: blacklistText,
+                  wrap: true,
+                  size: 'sm',
+                  color: '#475569'
+                }
+              ]
+            },
+
+            footer: {
+              type: 'box',
+              layout: 'vertical',
+              paddingAll: '16px',
+
+              contents: [
+                {
+                  type: 'button',
+                  style: 'primary',
+                  height: 'sm',
+
+                  action: {
+                    type: 'clipboard',
+                    label: 'คัดลอกข้อมูล',
+
+                    clipboardText:
+                      `DTAC\n` +
+                      `ID: ${detail.idCheck?.idNumber || query}\n` +
+                      `หมายเลข: ${displayNumber}\n` +
+                      `ชื่อ: ${name}\n` +
+                      `ประเภท: ${subscriber.telephoneType || '-'}\n` +
+                      `อายุการใช้งาน: ${subscriber.aouText || '-'}\n` +
+                      `สถานะ: ${status}\n` +
+                      `วันหมดสัญญา: ${item.contractEndDay ?? 0} วัน\n` +
+                      `Blacklist: ${blacklistText}`
+                  }
+                }
+              ]
+            }
+          };
+        });
+
+
+      return {
+        type: 'flex',
+        altText: `DTAC พบ ${subscriberList.length} หมายเลข`,
+
+        contents: {
+          type: 'carousel',
+          contents: bubbles
+        }
+      };
+    }
+
+
+    // =====================================================
+    // CASE 2 : ค้นด้วยเบอร์ 10 หลัก
+    // =====================================================
+
+    const customerInfo =
+      detail.customerInfo || {};
+
+    const nbtc =
+      detail.nbtc || {};
+
+    const deviceItems =
+      (detail.deviceSim?.deviceSIM || [])
+        .map(item =>
+          typeof item === 'string'
+            ? item
+            : item?.value
+        )
+        .filter(Boolean);
+
+    const name = [
+      d.customerTitle,
+      d.customerFirstName,
+      d.customerLastName
+    ]
+      .filter(Boolean)
+      .join(' ') ||
+      customerInfo.name ||
+      '-';
+
+    const type =
+      /prepaid|เติมเงิน/i.test(
+        `${d.subscriberType || ''} ${d.fromPackageGroupType || ''}`
+      )
+        ? 'เติมเงิน'
+        : 'รายเดือน';
+
+    const status =
+      String(d.subscriberStatus || '').toUpperCase() === 'A'
+        ? '✅ Active'
+        : (d.subscriberStatus || '-');
+
+    const packageItems =
+      Array.isArray(d.mainPackages)
+        ? d.mainPackages
+        : [];
+
+    const packageContents = [];
+
+    if (packageItems.length) {
+
+      packageItems.forEach((p, index) => {
+
+        packageContents.push({
+          type: 'text',
+          text: `${index + 1}. ${p.description || '-'}`,
+          size: 'sm',
+          color: '#334155',
+          wrap: true,
+          margin: index === 0 ? 'none' : 'sm'
+        });
+
+      });
+
+      if (packageItems[0]?.startDateTime) {
+
+        packageContents.push({
+          type: 'text',
+          text: `วันที่เริ่ม: ${packageItems[0].startDateTime}`,
+          size: 'sm',
+          color: '#64748B',
+          wrap: true,
+          margin: 'md'
+        });
+
+      }
+
+    } else {
+
+      packageContents.push({
+        type: 'text',
+        text: 'ไม่พบแพ็กเกจหลัก',
+        size: 'sm',
+        color: '#64748B'
+      });
+
+    }
+
+
+    const deviceContents = [
+      {
+        type: 'text',
+        text: `SIM Number: ${d.simCardNumber || '-'}`,
+        size: 'sm',
+        color: '#334155',
+        wrap: true
+      }
+    ];
+
+    deviceItems.forEach(value => {
+
+      deviceContents.push({
+        type: 'text',
+        text: `• ${value}`,
+        size: 'sm',
+        color: '#334155',
+        wrap: true,
+        margin: 'sm'
+      });
+
+    });
+
+
+    const packageCopyText =
+      packageItems.length
+        ? packageItems
+            .map(p => p.description || '-')
+            .join('\n')
+        : '-';
+
+    const deviceCopyText =
+      deviceItems.length
+        ? deviceItems.join('\n')
+        : '-';
+
+
+    return {
+      type: 'flex',
+      altText: `DTAC ${query}`,
+
+      contents: {
+        type: 'bubble',
+        size: 'mega',
+
+        header: {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: '#0F172A',
+          paddingAll: '18px',
+
+          contents: [
+            {
+              type: 'text',
+              text: `📘[ ${query} ]`,
+              color: '#FFFFFF',
+              weight: 'bold',
+              size: 'xl'
+            },
+
+            {
+              type: 'text',
+              text: 'DTAC CUSTOMER INFORMATION',
+              color: '#94A3B8',
+              size: 'xs',
+              margin: 'sm'
+            }
+          ]
+        },
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          paddingAll: '18px',
+          spacing: 'md',
+
+          contents: [
+
+            // =============================================
+            // บุคคล
+            // =============================================
+            {
+              type: 'text',
+              text: '👤 ข้อมูลสมาชิก',
+              weight: 'bold',
+              size: 'md',
+              color: '#0F172A'
+            },
+
+            {
+              type: 'text',
+              text:
+                `ชื่อ: ${name}\n` +
+                `ID: ${d.customerIDNumber || detail.idCheck?.idNumber || '-'}`,
+              wrap: true,
+              size: 'sm',
+              color: '#334155'
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // =============================================
+            // หมายเลข
+            // =============================================
+            {
+              type: 'text',
+              text: '📂 ข้อมูลหมายเลข',
+              weight: 'bold',
+              size: 'md',
+              color: '#0F172A',
+              margin: 'md'
+            },
+
+            {
+              type: 'text',
+              text:
+                `ประเภท: ${type}\n` +
+                `อายุการใช้งาน: ${d.aouText || '-'}\n` +
+                `สถานะ: ${status}\n` +
+                `กลุ่มลูกค้า: ${detail.segment?.segment || '-'}\n` +
+                `เลขสมาชิก: ${d.customerNumber || d.subscriberNumber || '-'}\n` +
+                `สถานะระบบ: ${d.subscriberStatus || '-'}\n` +
+                `NBTC: ${nbtc.result || '-'}`,
+              wrap: true,
+              size: 'sm',
+              color: '#334155'
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // =============================================
+            // Package
+            // =============================================
+            {
+              type: 'text',
+              text: '📦 แพ็กเกจหลัก',
+              weight: 'bold',
+              size: 'md',
+              color: '#0F172A',
+              margin: 'md'
+            },
+
+            ...packageContents,
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // =============================================
+            // Device
+            // =============================================
+            {
+              type: 'text',
+              text: '📲 ข้อมูลอุปกรณ์ / SIM',
+              weight: 'bold',
+              size: 'md',
+              color: '#0F172A',
+              margin: 'md'
+            },
+
+            ...deviceContents
+          ]
+        },
+
+        footer: {
+          type: 'box',
+          layout: 'vertical',
+          paddingAll: '16px',
+
+          contents: [
+            {
+              type: 'button',
+              style: 'primary',
+              height: 'sm',
+
+              action: {
+                type: 'clipboard',
+                label: 'คัดลอกข้อมูล',
+
+                clipboardText:
+                  `DTAC ${query}\n` +
+                  `ชื่อ: ${name}\n` +
+                  `ID: ${d.customerIDNumber || detail.idCheck?.idNumber || '-'}\n\n` +
+
+                  `ข้อมูลหมายเลข\n` +
+                  `ประเภท: ${type}\n` +
+                  `อายุการใช้งาน: ${d.aouText || '-'}\n` +
+                  `สถานะ: ${status}\n` +
+                  `กลุ่มลูกค้า: ${detail.segment?.segment || '-'}\n` +
+                  `เลขสมาชิก: ${d.customerNumber || d.subscriberNumber || '-'}\n` +
+                  `สถานะระบบ: ${d.subscriberStatus || '-'}\n` +
+                  `NBTC: ${nbtc.result || '-'}\n\n` +
+
+                  `แพ็กเกจหลัก\n${packageCopyText}\n\n` +
+
+                  `SIM Number: ${d.simCardNumber || '-'}\n` +
+                  `${deviceCopyText}`
+              }
+            }
+          ]
+        }
+      }
+    };
+  }
+
+
+  return {
+    type: 'text',
+    text: '❌ ไม่พบข้อมูล DTAC'
+  };
 }
 
 function buildCallerInfoFlex(number, location, details) {
@@ -842,7 +16703,7 @@ logoUrl = 'https://cdn.phototourl.com/free/2026-05-21-fa0e66e0-61be-4595-92f7-be
         paddingAll: '16px',
         contents: headerContents
       },
-      body: {
+            body: {
         type: 'box',
         layout: 'vertical',
         spacing: 'md',
@@ -851,6 +16712,30 @@ logoUrl = 'https://cdn.phototourl.com/free/2026-05-21-fa0e66e0-61be-4595-92f7-be
           infoLine('ตำแหน่ง', location || '-'),
           infoLine('เครือข่าย', carrier),
           infoLine('รายละเอียด', details || '-')
+        ]
+      },
+
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: '14px',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            height: 'sm',
+            color: color,
+            action: {
+              type: 'clipboard',
+              label: 'คัดลอกข้อมูล',
+              clipboardText:
+                `📡 ข้อมูลเครือข่าย\n` +
+                `หมายเลข: ${cleanNumber || '-'}\n` +
+                `ตำแหน่ง: ${location || '-'}\n` +
+                `เครือข่าย: ${carrier || '-'}\n` +
+                `รายละเอียด:\n${details || '-'}`
+            }
+          }
         ]
       }
     }
@@ -891,14 +16776,14 @@ function formatCrime(data, keyword = '') {
       const status = pickLine(text, 'STATUS');
 
       msg += `\n${index + 1}️⃣\n`;
-      msg += `┌● เลขหมายจับ : ${warrant}\n`;
-      msg += `├● เลขคดี : ${crimes}\n`;
-      msg += `├● เลขบัตรประชาชน : ${id !== '-' ? id : keyword}\n`;
-      msg += `├● ชื่อ : ${fullname}\n`;
-      msg += `├● ข้อหา : ${charge}\n`;
-      msg += `├● เจ้าของคดี : ${police}\n`;
-      msg += `├● เบอร์ติดต่อ : ${tell}\n`;
-      msg += `└● สถานะหมาย : ${status}\n`;
+      msg += `### เลขหมายจับ : ${warrant}\n`;
+      msg += `* **เลขคดี : ${crimes}\n`;
+      msg += `* **เลขบัตรประชาชน : ${id !== '-' ? id : keyword}\n`;
+      msg += `* **ชื่อ : ${fullname}\n`;
+      msg += `* **ข้อหา : ${charge}\n`;
+      msg += `* **เจ้าของคดี : ${police}\n`;
+      msg += `* **เบอร์ติดต่อ : ${tell}\n`;
+      msg += `* **สถานะหมาย : ${status}\n`;
     });
 
     return msg;
@@ -910,6 +16795,84 @@ function formatCrime(data, keyword = '') {
 
 function limitLineMessage(msg) {
   return msg.length > 4800 ? msg.slice(0, 4800) + '\n...ตัดข้อความ...' : msg;
+}
+
+async function fetchLeakOsintApi(query) {
+  if (!LEAKOSINT_API_TOKEN) {
+    throw new Error('ยังไม่ได้ตั้งค่า LEAKOSINT_API_TOKEN');
+  }
+
+  const { data } = await axios.post(
+    LEAKOSINT_API_URL,
+    {
+      token: LEAKOSINT_API_TOKEN,
+      request: query,
+      limit: 100,
+      lang: 'th',
+      type: 'json'
+    },
+    {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 120000
+    }
+  );
+
+  return data;
+}
+
+function formatLeakOsintResult(result, query, page = 1) {
+  if (!result || typeof result !== 'object') {
+    return '❌ API ส่งข้อมูลไม่ถูกต้อง';
+  }
+
+  if (result['Error code']) {
+    return `❌ LeakOSINT: ${result['Error code']}`;
+  }
+
+  const list = result.List;
+  if (!list || typeof list !== 'object') {
+    return limitLineMessage(JSON.stringify(result, null, 2));
+  }
+
+  const isPhoneQuery = /^\+?\d{8,}$/.test(query.replace(/[\s()-]/g, ''));
+  const databases = Object.entries(list).filter(([databaseName]) =>
+    isPhoneQuery || databaseName.trim().toLowerCase() !== 'thailand people database'
+  );
+  const totalPages = Math.max(1, ...databases.map(([, database]) => {
+    const rows = Array.isArray(database?.Data) ? database.Data : [];
+    return rows.length;
+  }));
+
+  if (page > totalPages) {
+    return `❌ ไม่พบหน้าที่ ${page} (มีทั้งหมด ${totalPages} หน้า)`;
+  }
+
+  const sections = [`🔎 ผลค้นหา LeakOSINT (หน้า ${page}/${totalPages})\nคำค้น: ${query}`];
+
+  for (const [databaseName, database] of databases) {
+    const infoLeak = String(database?.InfoLeak || '').trim();
+    const rows = Array.isArray(database?.Data) ? database.Data : [];
+    const row = rows[page - 1];
+    if (!row) continue;
+    const lines = [`📂 ${databaseName}`];
+
+    if (infoLeak) lines.push(infoLeak);
+    lines.push('', `รายการที่ ${page}`);
+    if (row && typeof row === 'object') {
+      for (const [key, value] of Object.entries(row)) {
+        const printable = value && typeof value === 'object'
+          ? JSON.stringify(value)
+          : String(value ?? '-');
+        lines.push(`${key}: ${printable}`);
+      }
+    } else {
+      lines.push(String(row));
+    }
+
+    sections.push(lines.join('\n'));
+  }
+
+  return limitLineMessage(sections.join('\n\n-------------------\n\n'));
 }
 
 async function createPhishingShortLink(targetUrl) {
@@ -1206,20 +17169,792 @@ function dplusValue(value) {
 }
 
 function formatDPlusCustomers(data, keyword) {
-  if (!Array.isArray(data) || data.length === 0) {
+  const response = data && typeof data === 'object' ? data : {};
+  const customers = Array.isArray(data) ? data : response.data;
+
+  if (response.code !== undefined && Number(response.code) !== 1) {
+    return `❌ ค้นหาข้อมูลไม่สำเร็จ: ${dplusValue(response.message)}`;
+  }
+
+  if (!Array.isArray(customers) || customers.length === 0) {
     return `❌ ไม่พบข้อมูลลูกค้าสำหรับเบอร์ ${keyword}`;
   }
 
-  const msg = `📁รายการ Shipping\n` + data.map((item, index) => `┌● ลำดับ: ${index + 1}
-├● ชื่อ: ${dplusValue(item.name)}
-├● เบอร์โทร: ${dplusValue(item.phone)}
-├● ที่อยู่: ${dplusValue(item.address || item.address_no)}
-├● ตำบล: ${dplusValue(item.district)}
-├● อำเภอ: ${dplusValue(item.amphure)}
-├● จังหวัด: ${dplusValue(item.province)}
-└● รหัสไปรษณีย์: ${dplusValue(item.zipcode)}`).join('\n\n');
+  const msg = `📦 พบข้อมูล ${customers.length} รายการ${response.message ? ` (${dplusValue(response.message)})` : ''}\n` +
+    customers.map((record, index) => {
+      const item = record && typeof record === 'object' ? record : {};
+      const address = [
+        dplusValue(item.detail_address || item.address || item.address_no),
+        item.district_name || item.district ? `ต.${dplusValue(item.district_name || item.district)}` : '',
+        item.city_name || item.amphure ? `อ.${dplusValue(item.city_name || item.amphure)}` : '',
+        item.province_name || item.province ? `จ.${dplusValue(item.province_name || item.province)}` : '',
+        item.postal_code || item.zipcode ? dplusValue(item.postal_code || item.zipcode) : ''
+      ].filter(Boolean).join(' ');
 
-return limitLineMessage(msg);
+      return `╭─ รายการ ${index + 1}\n` +
+        `├ 👤 ชื่อ: ${dplusValue(item.name)}\n` +
+        `├ ☎️ เบอร์โทร: ${dplusValue(item.phone || keyword)}\n` +
+        `├ 📍 ที่อยู่: ${address || '-'}\n` +
+        `╰ 🏷️ รหัสตำบล: ${dplusValue(item.district_code)}`;
+    }).join('\n\n');
+
+  return limitLineMessage(msg);
+}
+
+let storeListCache = null;
+let storeListCacheAt = 0;
+
+async function fetchStoreListApi() {
+
+  const CACHE_MS =
+    10 * 60 * 1000; // 10 นาที
+
+
+  // ใช้ cache ถ้ายังไม่หมดอายุ
+  if (
+    Array.isArray(storeListCache) &&
+    Date.now() - storeListCacheAt < CACHE_MS
+  ) {
+    return storeListCache;
+  }
+
+
+  const url =
+    process.env.STORE_API_URL;
+
+  const apiKey =
+    process.env.STORE_API_KEY;
+
+
+  if (!url) {
+    throw new Error(
+      'STORE_API_URL not configured'
+    );
+  }
+
+
+  if (!apiKey) {
+    throw new Error(
+      'STORE_API_KEY not configured'
+    );
+  }
+
+
+  const response =
+    await axios.post(
+      url,
+      null,
+      {
+        timeout: 45000,
+
+        headers: {
+          Accept:
+            'application/json, text/plain, */*',
+
+          'Content-Type':
+            'application/json',
+
+          'X-Api-Key':
+            apiKey
+        }
+      }
+    );
+
+
+  const stores =
+    Array.isArray(
+      response.data?.store
+    )
+      ? response.data.store
+      : [];
+
+
+  storeListCache =
+    stores;
+
+  storeListCacheAt =
+    Date.now();
+
+
+  return stores;
+}
+
+function searchStores(
+  stores,
+  keyword
+) {
+
+  const q =
+    String(keyword || '')
+      .trim()
+      .toLowerCase();
+
+
+  if (!q) {
+    return [];
+  }
+
+
+  // =====================================
+  // ถ้าค้นด้วยตัวเลขล้วน
+  // ให้ค้น STORE_ID เท่านั้น
+  // รองรับ 5 / 05 / 005 / 00005
+  // =====================================
+  if (/^\d+$/.test(q)) {
+
+    const normalizedQuery =
+      q.replace(
+        /^0+(?=\d)/,
+        ''
+      );
+
+
+    return stores.filter(store => {
+
+      const storeId =
+        String(
+          store?.STORE_ID || ''
+        )
+          .trim()
+          .replace(
+            /^0+(?=\d)/,
+            ''
+          );
+
+
+      return (
+        storeId ===
+        normalizedQuery
+      );
+    });
+  }
+
+
+  // =====================================
+  // ถ้าไม่ใช่ตัวเลข
+  // ค้นจากชื่อ / LINE / ที่อยู่ / จังหวัด
+  // =====================================
+  return stores.filter(store => {
+
+    const name =
+      String(
+        store?.STORE_NAME || ''
+      )
+        .trim()
+        .toLowerCase();
+
+
+    const lineId =
+      String(
+        store?.STORE_LINE_ID || ''
+      )
+        .trim()
+        .toLowerCase();
+
+
+    const address =
+      String(
+        store?.STORE_ADDRESS || ''
+      )
+        .trim()
+        .toLowerCase();
+
+
+    const province =
+      String(
+        store?.STORE_PROVINCE || ''
+      )
+        .trim()
+        .toLowerCase();
+
+
+    return (
+      name.includes(q) ||
+      lineId.includes(q) ||
+      address.includes(q) ||
+      province.includes(q)
+    );
+  });
+}
+
+function formatStoreSearchResult(
+  stores,
+  keyword
+) {
+
+  if (
+    !Array.isArray(stores) ||
+    stores.length === 0
+  ) {
+
+    return (
+`🏪 ค้นหาสาขา
+🔎 ค้นหา : ${keyword}
+❌ ไม่พบข้อมูล`
+    );
+  }
+
+
+  // ป้องกันข้อความ LINE ยาวเกิน
+  const MAX_RESULTS = 15;
+
+  const selected =
+    stores.slice(
+      0,
+      MAX_RESULTS
+    );
+
+
+  const items =
+    selected.map(
+      (store, index) => {
+
+        const rawId =
+  String(
+    store?.STORE_ID || ''
+  ).trim();
+
+const id =
+  /^\d+$/.test(rawId)
+    ? rawId.padStart(5, '0')
+    : (rawId || '-');
+
+        const name =
+          String(
+            store?.STORE_NAME || '-'
+          ).trim();
+
+        const lineId =
+          String(
+            store?.STORE_LINE_ID || '-'
+          ).trim();
+
+        const address =
+          String(
+            store?.STORE_ADDRESS || '-'
+          )
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const province =
+          String(
+            store?.STORE_PROVINCE || '-'
+          ).trim();
+
+
+        return (
+`📂 รายการที่ ${index + 1}
+🏪 รหัสสาขา : ${id}
+📍 ชื่อสาขา : ${name}
+💬 LINE : ${lineId}
+🏠 ที่อยู่ : ${address}
+🗺️ จังหวัด : ${province}`
+        );
+      }
+    )
+    .join(
+      '\n\n-  -  -  -  -  -  -  -\n\n'
+    );
+
+
+  let header =
+`🏪 ข้อมูลสาขา
+🔎 ค้นหา : ${keyword}
+✅ พบทั้งหมด ${stores.length} รายการ
+-  -  -  -  -  -  -  -`;
+
+
+  if (
+    stores.length >
+    MAX_RESULTS
+  ) {
+
+    header +=
+`\n📌 แสดง ${MAX_RESULTS} รายการแรก`;
+  }
+
+
+  return limitLineMessage(
+`${header}
+
+${items}`
+  );
+}
+
+async function fetchTrueSearchApi(keyword) {
+  const response = await axios.get(
+    'https://api-true.obtimus-team.cc/search',
+    {
+      params: {
+        token: process.env.TRUE_SEARCH_TOKEN,
+        key: keyword
+      },
+      timeout: 30000
+    }
+  );
+
+  if (!response.data?.ok) {
+    throw new Error('TRUE API returned unsuccessful result');
+  }
+
+  return response.data;
+}
+
+function formatTrueSearchResult(
+  result,
+  keyword,
+  member
+) {
+
+  const data = result?.data || {};
+
+  const isCitizenId =
+    /^\d{13}$/.test(keyword);
+
+  const isPassport =
+    /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{6,12}$/.test(keyword);
+
+  const isFullName =
+    /^[ก-๙A-Za-z.'-]+\s+[ก-๙A-Za-z.' -]+$/.test(keyword);
+
+  if (
+  isCitizenId ||
+  isPassport ||
+  isFullName
+) {
+    const customers = Array.isArray(data.customer)
+      ? data.customer
+      : [];
+
+    if (customers.length === 0) {
+      return `❌[${keyword}]\nไม่พบข้อมูลลูกค้า`;
+    }
+
+    // หา customer ที่ตรงกับเลขบัตร
+    const customer =
+  customers.find(
+    c =>
+      String(c?.idNumber || '')
+        .trim()
+        .toUpperCase() ===
+      String(keyword)
+        .trim()
+        .toUpperCase()
+  ) || customers[0];
+
+    // รวม assetList จาก customer ทุกชุด
+    const allAssets = [];
+
+    customers.forEach(c => {
+      if (Array.isArray(c?.assetList)) {
+        allAssets.push(...c.assetList);
+      }
+    });
+
+    // ลบรายการซ้ำ โดยใช้ assetRowId
+    const seen = new Set();
+
+    const assets = allAssets.filter(item => {
+      const key =
+        item?.assetRowId ||
+        [
+          item?.serviceId,
+          item?.productLine,
+          item?.startDate,
+          item?.ban
+        ].join('|');
+
+      if (seen.has(key)) {
+        return false;
+      }
+
+      seen.add(key);
+      return true;
+    });
+
+    // ------------------------------
+    // Helper
+    // ------------------------------
+
+    const thaiDate = value => {
+      if (!value) return '-';
+
+      const months = {
+        Jan: 'ม.ค.',
+        Feb: 'ก.พ.',
+        Mar: 'มี.ค.',
+        Apr: 'เม.ย.',
+        May: 'พ.ค.',
+        Jun: 'มิ.ย.',
+        Jul: 'ก.ค.',
+        Aug: 'ส.ค.',
+        Sep: 'ก.ย.',
+        Oct: 'ต.ค.',
+        Nov: 'พ.ย.',
+        Dec: 'ธ.ค.'
+      };
+
+      const clean = String(value)
+        .replace(',', '')
+        .trim();
+
+      const match = clean.match(
+        /^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})$/
+      );
+
+      if (match) {
+        const [, day, month, year] = match;
+
+        return `${Number(day)} ${months[month] || month} ${year}`;
+      }
+
+      return value;
+    };
+
+    const statusIcon = status => {
+      const s = String(status || '').toLowerCase();
+
+      if (s === 'active') return '🟢';
+      if (s === 'preactive') return '🟡';
+
+      return '🔴';
+    };
+
+    const paymentText = type => {
+      if (type === 'Prepay') return 'เติมเงิน';
+      if (type === 'Postpay') return 'รายเดือน';
+
+      return type || '-';
+    };
+
+    const cleanPackage = item => {
+      const plan = String(item?.pricePlan || '').trim();
+
+      if (!plan) return '-';
+
+      // HELLO 2025
+      if (/HELLO\s*2025/i.test(plan)) {
+        return 'HELLO 2025';
+      }
+
+      // True ID Plus Sim
+      if (/True\s*ID\s*Plus\s*Sim/i.test(plan)) {
+        return 'True ID Plus Sim';
+      }
+
+      return plan
+        .replace(/^\[[^\]]+\]\s*/, '')
+        .replace(/^[A-Z0-9_-]+-TMH\s+Prepay\s+/i, '')
+        .replace(/\s*\(recognition\)\s*$/i, '')
+        .trim();
+    };
+
+    // ------------------------------
+    // แบ่งประเภทบริการ
+    // ------------------------------
+
+    const currentMobile = assets.filter(item =>
+      item?.productLine === 'True Mobile' &&
+      item?.serviceId &&
+      String(item?.status || '').toLowerCase() === 'active' &&
+      (
+        item?.productType === 'Prepay' ||
+        item?.productType === 'Postpay'
+      )
+    );
+
+    const mobileHistory = assets.filter(item =>
+      item?.productLine === 'True Mobile' &&
+      item?.serviceId &&
+      String(item?.status || '').toLowerCase() !== 'active' &&
+      (
+        item?.productType === 'Prepay' ||
+        item?.productType === 'Postpay'
+      )
+    );
+
+    const trueOnline = assets.filter(item =>
+      item?.productLine === 'True Online' &&
+      item?.serviceId
+    );
+
+    const trueVisions = assets.filter(item =>
+      item?.productLine === 'True Visions' &&
+      item?.serviceId
+    );
+
+    // ------------------------------
+    // ข้อมูลลูกค้า
+    // ------------------------------
+
+    const fullName = [
+  customer?.firstName,
+  customer?.lastName
+]
+  .filter(Boolean)
+  .join(' ')
+  .trim() || '-';
+
+const searchTitle =
+  isFullName
+    ? fullName
+    : (customer?.idNumber || keyword);
+
+
+let text =
+  `📙: ${searchTitle}\n` +
+  `👤 ชื่อ : ${fullName}\n` +
+  `🎂 วันเกิด : ${thaiDate(customer?.birthDate)}\n` +
+  `🔢 อายุ : ${customer?.age || '-'} ปี\n` +
+  `${statusIcon(customer?.status)} สถานะ : ${customer?.status || '-'}\n` +
+  `💳 True Card : ${customer?.trueCardLevel || '-'} / ${customer?.trueCardStatus || '-'}\n`;
+
+    // ------------------------------
+    // หมายเลขปัจจุบัน
+    // ------------------------------
+
+    if (currentMobile.length > 0) {
+      text +=
+        `-  -  -  -  -  -  -  -\n` +
+        `📱 หมายเลขปัจจุบัน\n`;
+
+      currentMobile.forEach(item => {
+        text +=
+  `\n📞 ${item.serviceId}\n` +
+  `${statusIcon(item.status)} สถานะ : ${item.status || '-'} | ${paymentText(item.paymentType)}\n` +
+  `📅 เริ่ม : ${thaiDate(item.startDate)}\n`;
+
+        const packageName = cleanPackage(item);
+
+        if (packageName !== '-') {
+          text += `📦 ${packageName}\n`;
+        }
+
+        if (item.simCardNo) {
+          text += `📲 SIM : ${item.simCardNo}\n`;
+        }
+      });
+    }
+
+    // ------------------------------
+    // ประวัติหมายเลข
+    // ------------------------------
+
+    if (mobileHistory.length > 0) {
+      text +=
+        `-  -  -  -  -  -  -  -\n` +
+        `📋 ประวัติหมายเลข\n`;
+
+      mobileHistory.forEach(item => {
+        text +=
+  `\n📞 ${item.serviceId}\n` +
+  `${statusIcon(item.status)} สถานะ : ${item.status || '-'} | ${paymentText(item.paymentType)}\n` +
+  `📅 ${thaiDate(item.startDate)} - ${thaiDate(item.endDate || item.disconnectDate)}\n`;
+
+        if (item.ban) {
+          text += `🏦 BAN : ${item.ban}\n`;
+        }
+      });
+    }
+
+    // ------------------------------
+    // TRUE ONLINE
+    // ------------------------------
+
+    if (trueOnline.length > 0) {
+      text +=
+        `-  -  -  -  -  -  -  -\n` +
+        `🌐 True Online\n`;
+
+      trueOnline.forEach(item => {
+        text +=
+          `\n🌐 Service : ${item.serviceId}\n` +
+          `${statusIcon(item.status)} ${item.status || '-'} | ${item.productType || '-'}\n` +
+          `📅 ${thaiDate(item.startDate)} - ${thaiDate(item.endDate || item.disconnectDate)}\n`;
+
+        if (item.ban) {
+          text += `🏦 BAN : ${item.ban}\n`;
+        }
+      });
+    }
+
+    // ------------------------------
+    // TRUE VISIONS
+    // ------------------------------
+
+    if (trueVisions.length > 0) {
+      text +=
+        `-  -  -  -  -  -  -  -\n` +
+        `📺 True Visions\n`;
+
+      trueVisions.forEach(item => {
+        text +=
+          `\n📺 Service : ${item.serviceId}\n` +
+          `${statusIcon(item.status)} ${item.status || '-'} | ${item.productType || '-'}\n` +
+          `📅 เริ่ม : ${thaiDate(item.startDate)}\n`;
+
+        if (item.ban) {
+          text += `🏦 BAN : ${item.ban}\n`;
+        }
+      });
+    }
+
+    text +=
+  `-  -  -  -  -  -  -  -\n`;
+
+text +=
+  buildTrueSearchAudit(
+    member
+  );
+
+return text.trim();
+  }
+
+
+  // ========================================
+  // ค้นหาด้วยเบอร์โทรศัพท์ 10 หลัก
+  // ========================================
+
+  const assets = Array.isArray(data.asset)
+    ? data.asset
+    : [];
+
+  if (assets.length === 0) {
+    return `❌[${keyword}]\nไม่พบข้อมูลหมายเลข`;
+  }
+
+  const customerAsset = assets.find(
+    item => item?.customer?.firstName
+  );
+
+  const customer = customerAsset?.customer || {};
+
+  const customerName =
+    customer.firstName || '-';
+
+  const accountType =
+    customer.accountType === 'Individual'
+      ? 'บุคคล (Individual)'
+      : customer.accountType || '-';
+
+  const languageRaw =
+    assets.find(item => item?.language)?.language || '-';
+
+  const language =
+    languageRaw === 'Thai'
+      ? 'ไทย'
+      : languageRaw;
+
+  let text =
+  `📙: ${keyword}\n` +
+  `👤ชื่อ : ${customerName}\n` +
+  `💳ประเภทลูกค้า : ${accountType}\n` +
+  `✅บริการที่พบ : ${assets.length} รายการ\n` +
+  `-  -  -  -  -  -  -  -\n`;
+
+  assets.forEach((item, index) => {
+    const isActive =
+      String(item.status || '').toLowerCase() === 'active';
+
+    const icon = isActive ? '🟢' : '🔴';
+
+    const paymentType =
+      item.paymentType === 'Prepay'
+        ? 'เติมเงิน (Prepay)'
+        : item.paymentType === 'Postpay'
+          ? 'รายเดือน (Postpay)'
+          : item.paymentType || '-';
+
+    const serviceTitle =
+      isActive
+        ? `บริการปัจจุบัน — ${item.paymentType || '-'}`
+        : `ประวัติบริการ — ${item.paymentType || '-'}`;
+
+    text +=
+      `\n${index + 1}️⃣ ${serviceTitle}\n` +
+      `📞 หมายเลข : ${item.serviceId || keyword}\n` +
+      `${icon} สถานะ : ${item.status || '-'}\n` +
+      `💳 ระบบ : ${paymentType}\n` +
+      `📡 เครือข่าย : ${item.productLine || '-'}\n` +
+      `🏢 Company Code : ${item.companyCode || '-'}\n` +
+      `📅 วันที่เริ่มใช้งาน : ${item.startDate || '-'}\n`;
+
+    if (isActive) {
+      if (item.effectiveDate) {
+        text +=
+          `📅 Effective Date : ${item.effectiveDate}\n`;
+      }
+
+      if (item.pricePlan) {
+        const cleanPlan = String(item.pricePlan)
+          .replace(/^\[[^\]]+\]\s*/, '');
+
+        text += `📦 แพ็กเกจ : ${cleanPlan}\n`;
+      }
+
+      if (item.pricePlanCode) {
+        text +=
+          `🔢 Price Plan Code : ${item.pricePlanCode}\n`;
+      }
+
+      if (item.imsiNo) {
+        text += `📲 IMSI : ${item.imsiNo}\n`;
+      }
+
+      if (item.simCardNo) {
+        text +=
+          `💳 SIM Card No. : ${item.simCardNo}\n`;
+      }
+    }
+
+    if (!isActive) {
+      if (item.endDate) {
+        text +=
+          `📅 วันที่สิ้นสุด : ${item.endDate}\n`;
+      }
+
+      if (item.disconnectDate) {
+        text +=
+          `📅 วันที่ยกเลิก : ${item.disconnectDate}\n`;
+      }
+
+      if (item.ban) {
+        text += `🏦 BAN : ${item.ban}\n`;
+      }
+
+      if (item.billingCVGId) {
+        text +=
+          `🔢 Billing CVG ID : ${item.billingCVGId}\n`;
+      }
+
+      if (item.ccbsCustId) {
+        text +=
+          `🆔 CCBS Customer ID : ${item.ccbsCustId}\n`;
+      }
+
+      if (item.subId) {
+        text += `🆔 Sub ID : ${item.subId}\n`;
+      }
+
+      if (item.dataSource) {
+        text +=
+          `📂 Data Source : ${item.dataSource}\n`;
+      }
+    }
+
+    text +=
+      `🔗 One Bill : ${item.oneBillFlag || '-'}\n`;
+  });
+
+  text +=
+  `-  -  -  -  -  -  -  -\n`;
+
+text +=
+  buildTrueSearchAudit(
+    member
+  );
+
+  return text.trim();
 }
 
 async function fetchTVGCCApi(query) {
@@ -1243,6 +17978,18 @@ console.log('TVGCC ERROR:', err?.response?.data || err.message);
 throw err;
 }
 
+}
+
+async function fetchTVGCCCustomerInfo(ti) {
+  const { data } = await axios.get(TVGCC_API_BASE, {
+    params: { ti },
+    timeout: 120000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0'
+    }
+  });
+
+  return data;
 }
 
 async function fetchISMApi(citizenId) {
@@ -1294,7 +18041,7 @@ function tvgAddress(row) {
 function formatTVGCCDirectResult(result, query) {
   const mode = result?.mode === 'phone' ? 'เบอร์' : 'ชื่อ';
   const lines = [
-    `📙 ค้นหาจาก${mode}: ${result?.query || query}`,
+    `📙 ${mode}: ${result?.query || query}`,
     '-------------------',
     '┌● ข้อมูลลูกค้า',
     `├● ชื่อ-สกุล: ${tvgValue(result?.name)}`,
@@ -1330,7 +18077,7 @@ function formatTVGCCResult(result, query) {
   }
 
   const lines = [
-    `📙 ค้นหาจาก${mode}: ${result.query || query}`,
+    `📙 ${mode}: ${result.query || query}`,
     `✅ พบข้อมูลทั้งหมด: ${result.count ?? rows.length} รายการ`
   ];
 
@@ -1361,15 +18108,135 @@ function formatTVGCCResult(result, query) {
   return limitLineMessage(lines.join('\n'));
 }
 
+function formatFiberAddress(address) {
+  const raw = tvgValue(address);
+  if (raw === '-') return raw;
+  if (/[ตอจ]\./.test(raw) || /ตำบล|อำเภอ|จังหวัด/.test(raw)) return raw;
+
+  const parts = raw.split(/\s+/).filter(Boolean);
+  const postalIndex = parts.findIndex(part => /^\d{5}$/.test(part));
+  const end = postalIndex >= 0 ? postalIndex : parts.length;
+  if (end < 3) return raw;
+
+  const province = parts[end - 1];
+  const district = parts[end - 2];
+  const subdistrict = parts[end - 3];
+  const streetAddress = parts.slice(0, end - 3).join(' ');
+  return `${streetAddress} ต.${subdistrict} อ.${district} จ.${province}${postalIndex >= 0 ? ` ${parts[postalIndex]}` : ''}`.trim();
+}
+
+function formatFiberTvResult(result, query) {
+  if (!result || result.success === false || !result.fields) {
+    return `❌ ไม่พบข้อมูลลูกค้า Fiber TV สำหรับ ${query}`;
+  }
+
+  const fields = result.fields;
+  const value = (field, fallback = '-') => tvgValue(fields[field] ?? result[field] ?? fallback);
+  const status = value('status');
+  const overdue = value('overdue', '0.00');
+  const noOverdue = /^0(?:\.0+)?$/.test(overdue.replace(/,/g, ''));
+  const coordinate = result.latitude && result.longitude
+    ? `${result.latitude}, ${result.longitude}`
+    : 'ไม่มีข้อมูล';
+
+  return limitLineMessage(`🟠 ข้อมูลลูกค้า Fiber TV
+
+● ข้อมูลลูกค้า
+├● Customer No. : ${value('customerNumber')}
+├● ชื่อ : ${value('name')}
+├● โทรศัพท์ : ${value('phone')}
+├● Fax/Mobile : ${value('faxMobile')}
+└● ที่อยู่ : ${formatFiberAddress(value('address'))}
+
+● ข้อมูลการให้บริการ
+├● BAN No. : ${value('banValue')}
+├● Profile : ${value('profile')}
+├● System : ${value('system')}
+├● Company : ${value('company')}
+├● ประเภทลูกค้า : ${value('type')}
+├● สถานะ : ${/^Potential$/i.test(status) ? '🟡 Potential' : status}
+├● ภาษา : ${value('language').replace(/^T\s*-\s*/i, '')}
+└● อายุการใช้งาน : ${value('longevity')}
+
+● รายละเอียดบริการ
+├● จำนวนจุด DVB : ${value('dvb')} จุด
+└● จำนวนจุด OTT : ${value('ott')} จุด
+
+● ข้อมูลการบิล
+├● ใบแจ้งหนี้ล่าสุด : ${value('lastInvoice')} บาท
+├● ยอดค้างชำระ : ${overdue} บาท
+├● ยอดคงเหลือรวม : ${value('totalBalance')} บาท
+└● ATB2 Total Balance : ${value('atb2TotalBalance')} บาท
+
+● ข้อมูลเพิ่มเติม
+├● Address ID : ${value('addressId')}
+├● Query : ${result.query || query}
+└● พิกัด : ${coordinate}
+
+${noOverdue ? '✅ ไม่พบยอดค้างชำระ' : '⚠️ พบยอดค้างชำระ'}`);
+}
+
 function ismValue(value) {
   if (value === null || value === undefined) return '-';
   const text = String(value).trim();
   return text || '-';
 }
 
-function ismTableRows(section, headerName) {
-  const tables = Array.isArray(section?.tables) ? section.tables : [];
-  return tables.find(table => Array.isArray(table?.headers) && table.headers.includes(headerName))?.rows || [];
+function ismMoney(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount)
+    ? amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : ismValue(value);
+}
+
+function ismDate(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return ismValue(value);
+  return `${String(date.getUTCDate()).padStart(2, '0')}/${String(date.getUTCMonth() + 1).padStart(2, '0')}/${date.getUTCFullYear()}`;
+}
+
+function ismStatus(value) {
+  const status = ismValue(value);
+  return /^active$/i.test(status) ? `${status}✅` : status;
+}
+
+function ismAddress(value) {
+  const parts = String(value || '').split(',').map(part => part.trim());
+  if (parts.length < 7) return ismValue(value);
+  const [house, moo, , subdistrict, district, province, postal] = parts;
+  return {
+    line1: `${house || '-'} หมู่ ${moo || '-'} ต.${subdistrict || '-'}`,
+    line2: `อ.${district || '-'} จ.${province || '-'} ${postal || ''}`.trim()
+  };
+}
+
+function ismPushInvoiceGroups(lines, invoices, online = false) {
+  const groups = new Map();
+  (Array.isArray(invoices) ? invoices : []).forEach(invoice => {
+    const period = invoice.postingPeriod || invoice.invoicePostingPeriod || '-';
+    if (!groups.has(period)) groups.set(period, []);
+    groups.get(period).push(invoice);
+  });
+
+  groups.forEach((periodInvoices, period) => {
+    if (online) {
+      const first = periodInvoices[0] || {};
+      const amount = first.invoiceBalance ?? first.unpaidAmount;
+      const dueDate = first.invoiceDueDate || first.dueDate;
+      lines.push(`├● รอบบิล ${period} : ${ismMoney(amount)} บาท (ครบกำหนด ${ismDate(dueDate)})`);
+      return;
+    }
+
+    lines.push(`\n🧾 รอบบิล ${period}`);
+    periodInvoices.forEach((invoice, index) => {
+      const label = invoice.invoiceType || 'BILL';
+      const amount = invoice.unpaidAmount ?? invoice.invoiceBalance;
+      lines.push(`${index === 0 ? '┌' : '├'}● ${label} : ${ismMoney(amount)} บาท`);
+    });
+    const dueDate = periodInvoices.find(invoice => invoice.dueDate || invoice.invoiceDueDate);
+    lines.push(`└● กำหนดชำระ : ${ismDate(dueDate?.dueDate || dueDate?.invoiceDueDate)}`);
+  });
 }
 
 function formatISMResult(result, citizenId) {
@@ -1377,52 +18244,84 @@ function formatISMResult(result, citizenId) {
     return result.message ? `❌ ${result.message}` : `❌[${citizenId}] ไม่พบข้อมูล ISM`;
   }
 
-  const collection = result?.collection || null;
-  const contract = result?.contract || null;
-  const collectionRows = ismTableRows(collection, 'BAN');
-  const contractRows = ismTableRows(contract, 'หมายเลข');
-  const lines = [
-    `🔎 ค้นหาจากเลขบัตร: ${result?.query || citizenId}`
-  ];
+  const lines = [`📙 ${result?.query || citizenId}`];
+  const mobile = result?.mobileApi?.response?.data?.collection?.mobile;
+  const mobileItems = Array.isArray(mobile?.collectionList) ? mobile.collectionList : [];
+  const maxAllowItems = result?.mobileApi?.response?.data?.maxAllow?.mobile?.maxAllowList || [];
 
-  if (collection) {
-    lines.push('-------------------');
-    if (collectionRows.length) {
-      collectionRows.forEach((row, index) => {
-        lines.push(`┌● BAN ${index + 1}`);
-        lines.push(`├● เลขบัญชี: ${ismValue(row.ban)}`);
-        lines.push(`├● Company: ${ismValue(row.company)}`);
-        lines.push(`├● สถานะ: ${ismValue(row.banStatus)}`);
-        lines.push(`└● ยอดชำระ: ${ismValue(row.amount)}`);
-      });
-    }
+  if (mobile) {
+    lines.push('', '📱 MOBILE');
+    mobileItems.forEach(item => {
+      lines.push(`┌● สถานะ : ${ismValue(mobile.status)}`);
+      lines.push(`├● BAN : ${ismValue(item.ban)}`);
+      lines.push(`├● Company : ${ismValue(item.company)}`);
+      lines.push(`├● สถานะ BAN : ${ismValue(item.statusDesc || item.status)}`);
+      const mobileNo = item.mobileNoList?.[0]?.mobileNo;
+      lines.push(`├● เบอร์โทร : ${ismValue(mobileNo)}`);
+      lines.push(`└● ยอดรวม : ${ismMoney(item.amount ?? mobile.totalAmount)} บาท`);
+      ismPushInvoiceGroups(lines, item.invoiceList);
+    });
+
+    maxAllowItems.forEach(item => {
+      lines.push('', '📞 ข้อมูลเบอรโทร');
+      lines.push(`┌● เบอร์โทร : ${ismValue(item.mobileNo)}`);
+      lines.push(`├● สถานะ : ${ismStatus(item.statusDesc || item.status)}`);
+      lines.push(`└● วันที่เปิดใช้งาน : ${ismDate(item.activateDate)}`);
+    });
   }
 
-  if (contract) {
-    lines.push('-------------------');
-    if (contractRows.length) {
-      contractRows.forEach((row, index) => {
-        lines.push(`┌● หมายเลข ${index + 1}`);
-        lines.push(`├● เบอร์: ${ismValue(row.number)}`);
-        lines.push(`└● สถานะ: ${ismValue(row.status)}`);
-      });
-    }
+  const online = result?.onlineApi?.response?.data?.collection?.online;
+  const onlineItems = Array.isArray(online?.collectionList) ? online.collectionList : [];
+  if (online) {
+    lines.push('', '-  -  -  -  -  -  -  -', '🟠 TRUE ONLINE', '', ' ยอดค่าบริการ');
+    lines.push(`┌● สถานะ : ${ismValue(online.status)}`);
+    lines.push(`├● ยอดรวม : ${ismMoney(online.totalAmount)} บาท`);
+    lines.push(`└● ยอดเกินกำหนด : ${ismMoney(online.overdueAmount)} บาท`);
+
+    onlineItems.forEach((item, index) => {
+      lines.push('', ` รายการ ${index + 1}`);
+      lines.push(`┌● BAN : ${ismValue(item.ban)}`);
+      lines.push(`├● สถานะ : ${ismStatus(item.statusDesc || item.status)}`);
+      lines.push(`├● บริการ : ${ismValue(item.mobileNo)}`);
+      lines.push(`├● ยอดรวม : ${ismMoney(item.amount)} บาท`);
+      const address = ismAddress(item.address);
+      if (typeof address === 'string') {
+        lines.push(`├● ที่อยู่ : ${address}`);
+      } else {
+        lines.push(`├● ที่อยู่ : ${address.line1}`);
+        lines.push(`├● ${address.line2}`);
+      }
+      ismPushInvoiceGroups(lines, item.invoiceList, true);
+    });
   }
 
-  if (!collection && !contract) {
+  if (!mobile && !online) {
     return `❌[${citizenId}] ไม่พบข้อมูล ISM`;
   }
 
-  lines.push('-------------------');
   return limitLineMessage(lines.join('\n'));
 }
 
-async function fetchBQuikApi(query) {
-  const { data } = await axios.get(SEARCH_API_BASE, {
-    params: { bq: query, key: SEARCH_API_KEY },
-    timeout: 90000
-  });
-  return data;
+async function fetchBQuikApi(query, base = SECURE_SEARCH_API_BASE, backupBase = DXC_BACKUP_API_BASE) {
+  const tryRequest = async (url) => {
+    const { data } = await axios.get(url, {
+      params: { bq: query, key: SEARCH_API_KEY },
+      timeout: 90000
+    });
+    return data;
+  };
+
+  try {
+    const res = await tryRequest(base);
+    if (res?.success === false) {
+      console.error(`B-Quik หลัก (${base}) ไม่ success ใช้สำรอง (${backupBase}):`, res?.message || 'no success');
+      return await tryRequest(backupBase);
+    }
+    return res;
+  } catch (err) {
+    console.error(`B-Quik หลัก (${base}) ล่ม ใช้สำรอง (${backupBase}):`, err?.response?.data || err.message);
+    return await tryRequest(backupBase);
+  }
 }
 
 function bqValue(value) {
@@ -1654,43 +18553,176 @@ rows.slice(0, 1).forEach((item, i) => {
   return msg.trim();
 }
 
-async function fetchPEAApi(params) {
-  const { data: res } = await axios.get(SEARCH_API_BASE, {
-    params: { ...params, key: SEARCH_API_KEY },
-    timeout: 30000
-  });
-  if (!res.success) {
-    throw new Error(res.message || 'ดึงข้อมูลไม่สำเร็จ');
+async function fetchPEAApi(params, base = SECURE_SEARCH_API_BASE, backupBase = DXC_BACKUP_API_BASE) {
+  const tryRequest = async (url) => {
+    const { data: res } = await axios.get(url, {
+      params: { ...params, key: SEARCH_API_KEY },
+      timeout: 30000
+    });
+    if (!res.success) {
+      throw new Error(res.message || 'ดึงข้อมูลไม่สำเร็จ');
+    }
+    return res.data;
+  };
+
+  try {
+    return await tryRequest(base);
+  } catch (err) {
+    console.error(`PEA หลัก (${base}) ล่ม ใช้สำรอง (${backupBase}):`, err?.response?.data || err.message);
+    return await tryRequest(backupBase);
   }
-  return res.data;
 }
 
-async function fetchPEAApiFull(params) {
-  const { data: res } = await axios.get(SEARCH_API_BASE, {
-    params: { ...params, key: SEARCH_API_KEY },
-    timeout: 30000
-  });
-  if (!res.success) {
-    throw new Error(res.message || 'ดึงข้อมูลไม่สำเร็จ');
+async function fetchPEAApiFull(params, base = SECURE_SEARCH_API_BASE, backupBase = DXC_BACKUP_API_BASE) {
+  const tryRequest = async (url) => {
+    const { data: res } = await axios.get(url, {
+      params: { ...params, key: SEARCH_API_KEY },
+      timeout: 30000
+    });
+    if (!res.success) {
+      throw new Error(res.message || 'ดึงข้อมูลไม่สำเร็จ');
+    }
+    return res;
+  };
+
+  try {
+    return await tryRequest(base);
+  } catch (err) {
+    console.error(`PEA หลัก (${base}) ล่ม ใช้สำรอง (${backupBase}):`, err?.response?.data || err.message);
+    return await tryRequest(backupBase);
   }
-  return res;
 }
 
-async function fetchSearchApiRaw(params) {
-  const { data: res } = await axios.get(SEARCH_API_BASE, {
-    params: { ...params, key: SEARCH_API_KEY },
-    timeout: 30000
-  });
-  return res;
+async function fetchSearchApiRaw(params, base = SEARCH_API_BASE, backupBase = DXC_BACKUP_API_BASE) {
+  const tryRequest = async (url) => {
+    const { data: res } = await axios.get(url, {
+      params: { ...params, key: SEARCH_API_KEY },
+      timeout: 30000
+    });
+    return res;
+  };
+
+  // เฉพาะคำสั่งที่ยิง shadowtak หลักให้มีสำรอง ส่วน base เดิม (.113) ไม่แตะ
+  if (base !== SECURE_SEARCH_API_BASE) return tryRequest(base);
+
+  try {
+    return await tryRequest(base);
+  } catch (err) {
+    console.error(`Search หลัก (${base}) ล่ม ใช้สำรอง (${backupBase}):`, err?.response?.data || err.message);
+    return await tryRequest(backupBase);
+  }
 }
 
-async function fetchPrisonerApi(params) {
-  const first = await fetchSearchApiRaw(params);
+// =====================================
+// SI : AUTHORIZED DATA ADAPTER
+// =====================================
+async function queryAuthorizedSiData({
+  citizenId,
+  requesterUserId,
+  requesterPhone
+}) {
+
+  const id =
+    String(citizenId || '')
+      .replace(/\D/g, '');
+
+
+  if (!/^\d{13}$/.test(id)) {
+    throw new Error(
+      'เลขบัตรประชาชนไม่ถูกต้อง'
+    );
+  }
+
+
+  const apiBase =
+    process.env.SI_API_BASE_URL;
+
+  const apiKey =
+    process.env.SI_API_KEY;
+
+
+  if (!apiBase) {
+    throw new Error(
+      'SI_API_BASE_URL not configured'
+    );
+  }
+
+
+  if (!apiKey) {
+    throw new Error(
+      'SI_API_KEY not configured'
+    );
+  }
+
+
+  // ===============================
+  // Audit - ไม่บันทึกเลขบัตรเต็ม
+  // ===============================
+  console.log(
+    'AUTHORIZED SI REQUEST:',
+    {
+      requesterUserId:
+        requesterUserId || '-',
+
+      requesterPhone:
+        requesterPhone || '-',
+
+      citizenIdMasked:
+        '*********' +
+        id.slice(-4)
+    }
+  );
+
+
+  // ===============================
+  // เรียก API ฝั่ง Server เท่านั้น
+  // ===============================
+  const response =
+    await axios.get(
+      apiBase,
+      {
+        timeout: 30000,
+
+        params: {
+          si: id,
+          key: apiKey
+        },
+
+        headers: {
+          Accept:
+            'application/json, text/plain, */*',
+
+          'Accept-Language':
+            'th-TH,th;q=0.9,en;q=0.8',
+
+          'User-Agent':
+            'MEGABOT/1.0'
+        }
+      }
+    );
+
+
+  const data =
+    response.data;
+
+
+  if (!data) {
+    throw new Error(
+      'SI API returned empty response'
+    );
+  }
+
+
+  return data;
+}
+
+async function fetchPrisonerApi(params, base = SEARCH_API_BASE) {
+  const first = await fetchSearchApiRaw(params, base);
   const hasRows = Array.isArray(first?.data?.content) || Array.isArray(first?.content);
   if (first?.success || hasRows) return first;
 
   await new Promise(resolve => setTimeout(resolve, 700));
-  return fetchSearchApiRaw(params);
+  return fetchSearchApiRaw(params, base);
 }
 
 async function fetchNhsoRightApi(citizenId) {
@@ -1699,6 +18731,28 @@ async function fetchNhsoRightApi(citizenId) {
     timeout: 120000
   });
   return res;
+}
+
+async function fetchDxcMessageApi(params, base = SECURE_SEARCH_API_BASE, backupBase = DXC_BACKUP_API_BASE) {
+  const tryRequest = async (url) => {
+    const { data } = await axios.get(url, {
+      params: { ...params, key: SEARCH_API_KEY },
+      timeout: 120000
+    });
+    return data;
+  };
+
+  try {
+    const res = await tryRequest(base);
+    if (res?.success === false) {
+      console.error(`DXC หลัก (${base}) ไม่ success ใช้สำรอง (${backupBase}):`, res?.message || 'no success');
+      return await tryRequest(backupBase);
+    }
+    return res;
+  } catch (err) {
+    console.error(`DXC หลัก (${base}) ล่ม ใช้สำรอง (${backupBase}):`, err?.response?.data || err.message);
+    return await tryRequest(backupBase);
+  }
 }
 
 function formatNhsoRightApiResult(res, citizenId) {
@@ -1786,11 +18840,21 @@ function formatOpecStudentResult(res, citizenId) {
 }
 
 async function fetchDPlusCustomerApi(phone) {
-  const { data } = await axios.get(SEARCH_API_BASE, {
-    params: { f: phone, key: SEARCH_API_KEY },
-    timeout: 45000
-  });
-  return data;
+  const bases = [DPLUS_API_BASE, SEARCH_API_BASE].filter((base, index, list) => list.indexOf(base) === index);
+  let lastError;
+  for (const base of bases) {
+    try {
+      const { data } = await axios.get(base, {
+        params: { f: phone, key: SEARCH_API_KEY },
+        timeout: 45000
+      });
+      return data;
+    } catch (error) {
+      lastError = error;
+      console.error(`DPlus API (${base}) ล่ม:`, error?.response?.data || error.message);
+    }
+  }
+  throw lastError;
 }
 
 function stripHtml(value) {
@@ -2771,7 +19835,7 @@ async function searchIMEI(imei) {
     });
     const data = response.data;
     if (!data || !data.result || !data.result.imei) {
-      return `📳NANABOT
+      return `📳MEGABOT
 📱 ข้อมูลอุปกรณ์ (Device Info)
 
 ⛔ไม่พบข้อมูลรายการ หรือ ตัวเลขไม่ถูกต้อง
@@ -3059,64 +20123,49 @@ async function getWebInfo(url) {
 
 async function fetchCallerInfo(phone) {
   try {
-    const cleanNumber = (num) => String(num || '').replace(/\s+/g, '');
-
-    let apiPhone = phone;
-    if (/^0\d{9}$/.test(phone)) {
-      apiPhone = '+66' + phone.slice(1);
+    let cleanNumber = String(phone || '').replace(/\s+/g, '');
+    if (/^0\d{9}$/.test(cleanNumber)) {
+      cleanNumber = '+66' + cleanNumber.slice(1);
     }
 
-    const response = await axios.get(`https://whocalld.com/${apiPhone}`, {
-      headers: {
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'accept-encoding': 'gzip, deflate, br, zstd',
-        'accept-language': 'en-US,en;q=0.9',
-        connection: 'keep-alive',
-        host: 'whocalld.com',
-        'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132", "Brave";v="132"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
-        'sec-gpc': '1',
-        'upgrade-insecure-requests': '1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36'
+    const response = await axios.get('https://api.veriphone.io/v2/verify', {
+      params: {
+        key: '69E563A0E1884FA39C63B693CCEB60B1',
+        phone: cleanNumber
       },
-      timeout: 30000
+      timeout: 15000
     });
 
-    const html = String(response.data || '');
-    const numberMatch = html.match(/<h1[^>]*class="[^"]*number[^"]*"[^>]*>(.*?)<\/h1>/i);
-    const locationMatch = html.match(/<span[^>]*class="[^"]*location[^"]*"[^>]*>(.*?)<\/span>/i);
-    const detailMatch = html.match(/<div[^>]*class="[^"]*page[^"]*"[^>]*>[\s\S]*?<p[^>]*>(.*?)<\/p>/i);
+    const data = response.data;
 
-    const strip = (s) => String(s || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
-    const number = strip(numberMatch?.[1]) || phone;
-    const location = strip(locationMatch?.[1]) || 'ไม่พบข้อมูล';
-    let details = strip(detailMatch?.[1]) || 'ไม่พบข้อมูล';
-
-    if (/This seems to be a mobile phone/i.test(details)) {
-      let carrier = '';
-      if (/AIS/i.test(details)) carrier = 'AIS (ประเทศไทย)';
-      else if (/DTAC/i.test(details)) carrier = 'DTAC (ประเทศไทย)';
-      else if (/TRUE/i.test(details)) carrier = 'TRUE (ประเทศไทย)';
-      else if (/CAT|my/i.test(details)) carrier = 'CAT (ประเทศไทย)';
-      else if (/TOT/i.test(details)) carrier = 'TOT (ประเทศไทย)';
-      details = `เป็นหมายเลขโทรศัพท์เคลื่อนที่${carrier ? ' ผู้ให้บริการ ' + carrier : ''}`;
-    } else if (/This seems to be a landline phone/i.test(details)) {
-      details = 'เป็นหมายเลขโทรศัพท์บ้าน';
-    } else if (/No information found/i.test(details)) {
-      details = 'ไม่พบข้อมูล';
-    } else if (/The number is not valid/i.test(details)) {
-      details = 'หมายเลขไม่ถูกต้อง';
+    if (!data || data.status !== 'success') {
+      return {
+        type: 'text',
+        text: `❌ ไม่พบข้อมูลสำหรับเบอร์ ${cleanNumber}`
+      };
     }
 
-    return buildCallerInfoFlex(number, location, details);
+    const location =
+  `${data.country || '-'} ${data.timezone?.[0] || ''}`.trim();
+
+const details =
+  `สถานะ: ${data.phone_valid ? 'เบอร์ถูกต้อง' : 'เบอร์ไม่ถูกต้อง'}\n` +
+  `ประเภท: ${data.phone_type || '-'}\n` +
+  `ผู้ให้บริการ: ${data.carrier || '-'}\n` +
+  `E.164: ${data.e164 || '-'}\n` +
+  `ประเทศ: ${data.country || '-'} (${data.country_code || '-'})`;
+
+return buildCallerInfoFlex(
+  data.phone || cleanNumber,
+  location,
+  details
+);
 
   } catch (error) {
-    return 'ไม่สามารถดึงข้อมูลได้: ' + error.message;
+    return {
+      type: 'text',
+      text: '❌ ไม่สามารถดึงข้อมูลได้: ' + (error.response?.data?.message || error.message)
+    };
   }
 }
 
@@ -3340,6 +20389,272 @@ function formatPrisonerRecords(data, input, isRemand = false) {
 
   msg += isRemand ? `แสดงทั้งหมด ${content.length} รายการ` : `แสดง ${content.length} รายการ`;
   return limitLineMessage(msg);
+}
+
+function formatPrisonerRecordsFlex(data, input, isRemand = false) {
+
+  const content = getPrisonerContent(data);
+
+  const label = isRemand
+    ? 'ผู้ต้องขัง (ยังไม่พิพากษา)'
+    : 'ผู้ต้องขัง';
+
+  if (data?.success === false && !content.length) {
+    return {
+      type: 'text',
+      text: `❌ ${data.message || `ไม่พบข้อมูล${label} สำหรับ "${input}"`}`
+    };
+  }
+
+  if (!content.length) {
+    return {
+      type: 'text',
+      text: `❌ ไม่พบข้อมูล${label} สำหรับ "${input}"`
+    };
+  }
+
+  const sv = (value, fallback = '-') => {
+    if (value === null || value === undefined) return fallback;
+
+    const text = String(value).trim();
+
+    return text ? text : fallback;
+  };
+
+
+  // จำกัดสูงสุด 10 Bubble
+  const bubbles = content
+    .slice(0, 10)
+    .map((item, idx) => {
+
+      const sex =
+        item.sex === 'MALE'
+          ? 'ชาย'
+          : item.sex === 'FEMALE'
+            ? 'หญิง'
+            : sv(item.sex);
+
+      const fatherName =
+        `${item.fatherPrefix || ''}${item.fatherFirstName || '-'} ${item.fatherLastName || ''}`.trim();
+
+      const motherName =
+        `${item.motherPrefix || ''}${item.motherFirstName || '-'} ${item.motherLastName || ''}`.trim();
+
+      const fullName =
+        `${item.firstName || '-'} ${item.lastName || '-'}`.trim();
+
+      const address =
+        formatPrisonerAddress(item) || '-';
+
+
+      // ================================
+      // ข้อมูลส่วนบุคคล
+      // ================================
+      const bodyContents = [
+
+        {
+          type: 'text',
+          text: '👤 ข้อมูลบุคคล',
+          weight: 'bold',
+          size: 'md',
+          color: '#0F172A'
+        },
+
+        {
+          type: 'text',
+          text:
+            `ชื่อ-สกุล: ${fullName}\n` +
+            `เลขบัตร: ${sv(item.citizenCardNumber)}\n` +
+            `วันเกิด: ${sv(item.dateOfBirth)}\n` +
+            `เพศ: ${sex}\n` +
+            `สัญชาติ: ${sv(item.nationality)}\n` +
+            `ศาสนา: ${sv(item.religious)}`,
+          wrap: true,
+          size: 'sm',
+          color: '#334155',
+          margin: 'md'
+        },
+
+        {
+          type: 'separator',
+          margin: 'lg'
+        },
+
+        // ================================
+        // การศึกษา
+        // ================================
+        {
+          type: 'text',
+          text: '🎓 ข้อมูลการศึกษา',
+          weight: 'bold',
+          size: 'md',
+          color: '#0F172A',
+          margin: 'lg'
+        },
+
+        {
+          type: 'text',
+          text:
+            isRemand
+              ? `ระดับ: ${sv(item.educationLevel)}\n` +
+                `สถานศึกษา: ${sv(item.educationSchool)}`
+              : `ระดับ: ${sv(item.educationLevel)}\n` +
+                `สถานศึกษา: ${sv(item.educationSchool)}\n` +
+                `จังหวัด: ${sv(item.educationProvince)}`,
+          wrap: true,
+          size: 'sm',
+          color: '#334155'
+        },
+
+        {
+          type: 'separator',
+          margin: 'lg'
+        },
+
+        // ================================
+        // ข้อมูลเรือนจำ / คดี
+        // ================================
+        {
+          type: 'text',
+          text: '⚖️ ข้อมูลคดี / เรือนจำ',
+          weight: 'bold',
+          size: 'md',
+          color: '#0F172A',
+          margin: 'lg'
+        },
+
+        {
+          type: 'text',
+          text:
+            `เรือนจำ: ${sv(item.prisonName)}\n` +
+            `เลขผู้ต้องขัง: ${sv(item.prisonerId)}\n` +
+            `วันรับตัว: ${sv(item.receiveDate)}\n` +
+            `วันปล่อยตัว: ${sv(item.releaseDate)}\n` +
+            `ข้อหา: ${sv(item.allegation)}\n` +
+            `คดีแดง/ดำ: ${sv(item.decidedCaseId)} / ${sv(item.undecidedCaseId)}\n` +
+            `ศาล: ${sv(item.courtName)}\n` +
+            `วันตัดสิน: ${sv(item.sentenceDate)}`,
+          wrap: true,
+          size: 'sm',
+          color: '#334155'
+        },
+
+        {
+          type: 'separator',
+          margin: 'lg'
+        },
+
+        // ================================
+        // ครอบครัว
+        // ================================
+        {
+          type: 'text',
+          text: '👨‍👩‍👧 ข้อมูลครอบครัว',
+          weight: 'bold',
+          size: 'md',
+          color: '#0F172A',
+          margin: 'lg'
+        },
+
+        {
+          type: 'text',
+          text:
+            `บิดา: ${fatherName}\n` +
+            `มารดา: ${motherName}`,
+          wrap: true,
+          size: 'sm',
+          color: '#334155'
+        },
+
+        {
+          type: 'separator',
+          margin: 'lg'
+        },
+
+        // ================================
+        // ที่อยู่
+        // ================================
+        {
+          type: 'text',
+          text: '📍 ที่อยู่',
+          weight: 'bold',
+          size: 'md',
+          color: '#0F172A',
+          margin: 'lg'
+        },
+
+        {
+          type: 'text',
+          text: address,
+          wrap: true,
+          size: 'sm',
+          color: '#334155'
+        }
+      ];
+
+
+      return {
+        type: 'bubble',
+        size: 'mega',
+
+        header: {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: isRemand
+            ? '#92400E'
+            : '#7F1D1D',
+          paddingAll: '18px',
+
+          contents: [
+            {
+              type: 'text',
+              text: `👮‍♂️ ${label}`,
+              weight: 'bold',
+              size: 'lg',
+              color: '#FFFFFF',
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: `รายการ ${idx + 1} จาก ${content.length}`,
+              size: 'sm',
+              color: '#FDE68A',
+              margin: 'sm'
+            },
+
+            {
+              type: 'text',
+              text: fullName,
+              size: 'xl',
+              weight: 'bold',
+              color: '#FFFFFF',
+              margin: 'md',
+              wrap: true
+            }
+          ]
+        },
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          paddingAll: '18px',
+          spacing: 'sm',
+          contents: bodyContents
+        }
+      };
+    });
+
+
+  return {
+    type: 'flex',
+    altText: `ข้อมูล${label} พบ ${content.length} รายการ`,
+
+    contents: {
+      type: 'carousel',
+      contents: bubbles
+    }
+  };
 }
 
 function formatPEAMeterRecords(peaData, title, page = 0, exactName = '') {
@@ -3732,348 +21047,350 @@ function buildMenuFooter() {
   };
 }
 
-function buildMenuCarouselFlex() {
+function buildMenuText() {
+  return `📂 คำค้นในระบบ
+-  -  -  -  -  -  -  -
+📶 จดทะเบียนเบอร์โทร
+┗📘d#เบอร์โทร/เลขบัตร → จดทะเบียน DTAC
+┗📙t#เบอร์โทร/เลขบัตร/ชื่อ สกุล → จดทะเบียน True
+
+🌐 ตรวจข้อมูลรายเดือน True Online / True Fiber
+┗ tid#เลขบัตร → True Fiber
+┗ tv#เลขกล่อง → จุดติดตั้ง
+
+📱 ข้อมูลเครือข่าย
+┗ %เบอร์โทร 10 หลัก → เช็คปิด/เปิดเครื่อง
+┗ ตัวอย่าง: %0812345678
+┗ ?เบอร์โทร 10 หลัก → ตรวจเครือข่ายเบอร์
+
+📦 พัสดุและการจัดส่ง
+┗ f#เบอร์โทร → ตรวจพัสดุ
+┗ tic%เลขพัสดุ → ตรวจภาพรับพัสดุ
+
+🏦 Bank / Cell
+┗ bn%ชื่อธนาคาร/รหัสสาขา → ค้นหาข้อมูลธนาคาร
+┗ atm%รหัสตู้ → ตรวจสอบจุดติดตั้ง ATM
+┗ b%mcc/mnc/lac/cid → ตรวจพิกัดเสา Base
+
+🏥 การรักษาและสถานพยาบาล
+┗ h#เลขบัตร → ตรวจข้อมูลการรักษา
+┗ nm%รหัสหน่วยบริการ/ชื่อสถานพยาบาล → ค้นหาสถานพยาบาล
+┗ dc%ชื่อ สกุล → ตรวจแพทย์
+┗ dr%ชื่อ สกุล → ตรวจแพทย์/บุคลากรสาธารณสุข
+
+🏛️ ประกันสังคมและสวัสดิการ
+┗ si%เลขบัตร → ตรวจประกันสังคม
+┗ wf%เลขบัตร → ตรวจเบี้ยยังชีพ
+┗ kp%เลขบัตร/เลขสมาชิก → ตรวจมาชิก สก.ทบ.
+
+⚖️ กฎหมาย / คดี / หมายจับ
+┗ dl#เลขบัตร → ตรวจใบขับขี่
+┗ pb%เลขบัตร → ตรวจคุมประพฤติ
+┗ nb%เลขบัตร → ตรวจประวัติคดียาเสพติด
+┗ psi#เลขบัตร → ตรวจผู้ต้องขัง
+┗ ps#เลขบัตร → ตรวจผู้ต้องขังยังไม่พิพากษา
+┗ c#เลขบัตร → ตรวจหมายจับ CRIME
+┗ doc#เลขบัตร → ตรวจหมายจับศาล
+┗ lw%คำถาม → ค้นหาข้อกฎหมาย
+
+🏢 บริษัท / ใบอนุญาต
+┗ dbd%เลขนิติบุคคล → ตรวจข้อมูลจดทะเบียนนิติบุคคล
+┗ lc%ชื่อ-สกุล,ชื่อบริษัท → ตรวจใบอนุญาตบริษัท
+┗ for%เลขนิติบุคคล → ตรวจทะเบียนพาณิชย์/นิติบุคคล
+┗ tr%ชื่อผู้ประกอบการ → ตรวจผู้ประกอบการขนส่ง
+┗ tisi%เลข มอก. → ตรวจมาตรฐาน มอก.
+
+🚘 ยานพาหนะ
+┗ cid#เลขบัตร → ตรวจรถจากเลขบัตร
+┗ car#จังหวัด หมวด ตัวเลข ประเภทรถ → ตรวจสอบจากทะเบียน
+┗ ตัวอย่าง: car#กรุงเทพ 1กก 334 1
+┗ pt% → อ่านป้ายทะเบียนและวิเคราะห์รถ
+┗ หมายเหตุ: รอระบบแจ้งให้ส่งภาพ
+┗ tro%หมวดอักษร หมวดตัวเลข จังหวัด → ตรวจสอบเข้า ตรอ.
+┗ ตัวอย่าง: tro%1กก 334 กรุงเทพ
+┗ bq%เบอร์โทร/เลขบัตร → ตรวจสอบศูนย์บริการรถ
+
+👤 เปรียบเทียบใบหน้า
+┗ ff% → เปรียบเทียบใบหน้า
+┗ หมายเหตุ: รอระบบแจ้งให้ส่งภาพ
+
+⚡ ไฟฟ้านครหลวง
+┗ mea%ชื่อ สกุล → ตรวจสอบข้อมูลไฟฟ้า MEA
+┗ kru%เลขมิเตอร์ → ตรวจสอบมิเตอร์
+
+⚡ ไฟฟ้าภูมิภาค
+┗ peac%เลข CA → ค้นหาจาก CA
+┗ pean%ชื่อ สกุล → ค้นหาชื่อ-สกุล
+┗ peau%ที่อยู่ → ค้นหาที่อยู่
+┗ peab%เลข CA เลขมิเตอร์ → ประวัติการใช้
+
+🌐 ออนไลน์ 
+┗ phis%URL → เพิ่ม Phishing
+┗ chphis%ID → ตรวจผล Phishing
+┗ picf%URL → ดึงภาพ Profile Facebook
+┗ soc%Username/ชื่อโซเชียล → ค้นหาโซเชียล
+┗ web%ชื่อเว็บไซต์ → ตรวจเว็บไซต์
+┗ loa%ชื่อแอป → ตรวจแอปเงินกู้
+
+📡 ข้อมูลเครือข่ายและอุปกรณ์
+┗ ip%เลข IP → ตรวจสอบเครือข่าย IP
+┗ imei%เลข IMEI → ตรวจสอบ IMEI
+┗ imsi%เลข IMSI → ตรวจสอบ IMSI
+┗ icc%เลข ICCID → ตรวจสอบเลขซิม
+
+🗺️ แผนที่ระยะทาง
+┗ dis%พิกัดต้นทาง/พิกัดปลายทาง → คำนวณระยะทาง
+┗ map%ละติจูด,ลองจิจูด → ตรวจสอบพิกัด MAP
+
+📹 เครื่องมืออื่น ๆ
+┗ cj%เบอร์โทร เลขบัตร → ตรวจสอบสมาชิก CJ
+┗ se%รหัสสาขา 7-11 → ตรวจสอบสาขาเซเว่น
+┗ sc%เลขบัตร → ตรวจสอบประวัติการผ่อนสินค้า
+┗ cctv%เวลากล้อง,เวลาจริง → เปรียบเทียบเวลากล้อง
+-  -  -  -  -  -  -  -`;
+}
+
+function buildWelfareMenuFlex() {
   return {
     type: 'flex',
-    altText: 'MENU NANA',
+
+    altText: 'ตรวจสอบข้อมูลสวัสดิการแห่งรัฐ',
+
     contents: {
-      type: 'carousel',
-      contents: [
-        {
-          type: 'bubble',
-          size: 'mega',
-          header: {
-            type: 'box',
-            layout: 'vertical',
-            backgroundColor: '#7F1D1D',
-            paddingAll: '16px',
-            contents: [
-              {
-                type: 'text',
-                text: '⚠️ WARNING',
-                color: '#FFFFFF',
-                weight: 'bold',
-                size: 'lg'
-              },
-              {
-                type: 'text',
-                text: 'อ่านก่อนใช้งานคำสั่ง',
-                color: '#FECACA',
-                size: 'sm',
-                margin: 'sm'
-              }
-            ]
-          },
-          body: {
-            type: 'box',
-            layout: 'vertical',
-            spacing: 'md',
-            contents: [
-              menuSection('ข้อควรระวัง', [
-                '• ไม่ต้องเว้นวรรค',
-                '• ใช้อักษรพิมพ์เล็กเท่านั้น',
-                '• ตรวจสอบคำสั่งก่อนส่ง',
-                '• สืบค้นผิดประเภท อาจทำให้สิทธิ์การใช้งานถูกแบน',
-                '• กรุณารักษาสิทธิ์ของตนเอง'
-              ])
-            ]
-          },
-          footer: buildMenuFooter()
-        },
+      type: 'bubble',
+      size: 'mega',
 
-        {
-          type: 'bubble',
-          size: 'mega',
-          header: {
-            type: 'box',
-            layout: 'vertical',
-            backgroundColor: '#0F172A',
-            paddingAll: '16px',
-            contents: [
-              {
-                type: 'text',
-                text: '📂 NANABOT 1/5',
-                color: '#FFFFFF',
-                weight: 'bold',
-                size: 'lg'
-              },
-              {
-                type: 'text',
-                text: 'เครือข่าย / ขนส่ง / ธนาคาร',
-                color: '#CBD5E1',
-                size: 'sm',
-                margin: 'sm'
-              }
-            ]
-          },
-          body: {
-            type: 'box',
-            layout: 'vertical',
-            spacing: 'md',
-            contents: [
-              menuSection('📶 เครือข่าย / โทรศัพท์', [
-                '• %66xxxxxxxxx → สถานะเบอร์',
-                '• ?เบอร์โทร → เครือข่ายเบอร์',
-                '• a#เบอร์โทร/เลขบัตร → REG AIS',
-                '• d#เบอร์โทร/เลขบัตร → REG DTAC',
-                '• t#เบอร์ → REG TRUE',
-                '• tid#เลขบัตร → REG TRUE',
-                '• tn#ชื่อ-นามสกุล → REG TRUE'
-              ]),
-              menuSection('📦 ระบบขนส่ง', [
-                '• f#เบอร์โทร → พัสดุทั่วไป',
-                '• fx#เบอร์โทร/ชื่อสกุล → พัสดุแบบละเอียด',
-                '• tic%เลขพัสดุ → ภาพรับพัสดุ'
-              ]),
-              menuSection('🏦 ธนาคาร / ATM', [
-                '• bn%ชื่อธนาคาร → ค้นหาธนาคาร',
-                '• bc%รหัสสาขา → สาขาธนาคาร',
-                '• bk%เลขบัญชี → บัญชีธนาคาร',
-                '• atm%รหัสตู้ → จุดติดตั้ง ATM',
-                '• cell%LAC,CID → พิกัด Cell'
-              ])
-            ]
-          },
-          footer: buildMenuFooter()
-        },
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0F172A',
+        paddingAll: '18px',
 
-        {
-          type: 'bubble',
-          size: 'mega',
-          header: {
-            type: 'box',
-            layout: 'vertical',
-            backgroundColor: '#1E293B',
-            paddingAll: '16px',
-            contents: [
-              {
-                type: 'text',
-                text: '📂 NANABOT 2/5',
-                color: '#FFFFFF',
-                weight: 'bold',
-                size: 'lg'
-              },
-              {
-                type: 'text',
-                text: 'สุขภาพ / บุคคล / หมายจับ',
-                color: '#CBD5E1',
-                size: 'sm',
-                margin: 'sm'
-              }
-            ]
+        contents: [
+          {
+            type: 'text',
+            text: '🏛️ ตรวจสอบข้อมูลสวัสดิการแห่งรัฐ',
+            color: '#FFFFFF',
+            weight: 'bold',
+            size: 'lg',
+            wrap: true
           },
-          body: {
-            type: 'box',
-            layout: 'vertical',
-            spacing: 'md',
-            contents: [
-              menuSection('🏥 สุขภาพ / การรักษา', [
-                '• pid%เลขบัตร → ตรวจสอบสิทธิ',
-                '• h%เลขบัตร → ตรวจสอบข้อมูลการรักษา',
-                '• nm%รหัสหน่วยบริการ/ชื่อสถานพยาบาล → ค้นหาสถานพยาบาล'
-              ]),
-              menuSection('🎓 การศึกษา', [
-                '• st%เลขบัตรบุตร → ตรวจสอบข้อมูลการศึกษา',
-                '• ใช้เลขบัตรของบุตรเท่านั้น'
-              ]),
-              menuSection('🔎 ตรวจสอบบุคคล', [
-                '• si%เลขบัตร → ตรวจสอบประกันสังคม',
-                '• dc%ชื่อ สกุล → ตรวจสอบแพทย์',
-                '• dl#เลขบัตร → ตรวจสอบใบขับขี่',
-                '• pb%เลขบัตร → ตรวจสอบคุมประพฤติ',
-                '• psi#เลขบัตร → ตรวจสอบผู้ต้องขัง',
-                '• ps#เลขบัตร → ผู้ต้องขังยังไม่พิพากษา',
-                '• wf%เลขบัตร → เบี้ยยังชีพ'
-              ]),
-              menuSection('🚔 หมายจับ', [
-                '• c#เลขบัตร → หมายจับ CRIME',
-                '• doc#เลขบัตร → หมายจับศาล'
-              ])
-            ]
-          },
-          footer: buildMenuFooter()
-        },
 
-        {
-          type: 'bubble',
-          size: 'mega',
-          header: {
-            type: 'box',
-            layout: 'vertical',
-            backgroundColor: '#334155',
-            paddingAll: '16px',
-            contents: [
-              {
-                type: 'text',
-                text: '📂 NANABOT 3/5',
-                color: '#FFFFFF',
-                weight: 'bold',
-                size: 'lg'
-              },
-              {
-                type: 'text',
-                text: 'รถ / AI / ไฟฟ้า',
-                color: '#CBD5E1',
-                size: 'sm',
-                margin: 'sm'
-              }
-            ]
-          },
-          body: {
-            type: 'box',
-            layout: 'vertical',
-            spacing: 'md',
-            contents: [
-              menuSection('🚗 ครอบครองรถ / ทะเบียน', [
-                '• cid#เลขบัตร → ตรวจจากเลขบัตร',
-                '• car#จังหวัด หมวด ตัวเลข ประเภทรถ → ตรวจจากทะเบียน',
-                '• ตัวอย่าง: car#กรุงเทพ 1กก 334 1',
-                '• pt% → อ่านป้ายทะเบียนและวิเคราะห์รถ',
-                '• รอระบบแจ้งให้ส่งภาพ'
-              ]),
-              menuSection('🤖 AI / เปรียบเทียบ', [
-                '• ff% → เปรียบเทียบใบหน้า',
-                '• รอระบบแจ้งให้ส่งภาพ'
-              ]),
-              menuSection('⚡ ไฟฟ้า / ยูทิลิตี้', [
-                '• mea%ชื่อสกุล → ข้อมูลไฟฟ้า MEA',
-                '• kru%เลขมิเตอร์ → ตรวจสอบมิเตอร์',
-                '• peab%เลขCA เว้นวรรค เลขมิเตอร์ → ประวัติใช้ไฟ',
-                '• peac%เลข CA → ข้อมูลจาก CA',
-                '• pean%ชื่อสกุล → ข้อมูลจากชื่อสกุล',
-                '• peau%ที่อยู่ → ข้อมูลจากที่อยู่'
-              ])
-            ]
-          },
-          footer: buildMenuFooter()
-        },
+          {
+            type: 'text',
+            text: 'STATE WELFARE CHECK',
+            color: '#94A3B8',
+            size: 'xs',
+            margin: 'sm'
+          }
+        ]
+      },
 
-        {
-          type: 'bubble',
-          size: 'mega',
-          header: {
-            type: 'box',
-            layout: 'vertical',
-            backgroundColor: '#475569',
-            paddingAll: '16px',
-            contents: [
-              {
-                type: 'text',
-                text: '📂 NANABOT 4/5',
-                color: '#FFFFFF',
-                weight: 'bold',
-                size: 'lg'
-              },
-              {
-                type: 'text',
-                text: 'เครื่องมือ / ร้านค้า / อื่น ๆ',
-                color: '#CBD5E1',
-                size: 'sm',
-                margin: 'sm'
-              }
-            ]
-          },
-          body: {
-            type: 'box',
-            layout: 'vertical',
-            spacing: 'md',
-            contents: [
-              menuSection('🌐 เครื่องมือ / ข้อมูลอื่นๆ', [
-                '• phis%URL → เพิ่ม Phishing',
-                '• chphis%ID → ตรวจ Phishing',
-                '• picf%url → ดึงภาพ Profile Facebook',
-                '• dr%ชื่อ สกุล → ข้อมูลแพทย์/บุคลากรสาธารณสุข',
-                '• soc%Username/ชื่อโซเชียล → ค้นหาโซเชียล',
-                '• ip%เลข IP → ตรวจเครือข่าย IP',
-                '• imei%เลข IMEI → ตรวจ IMEI',
-                '• imsi%เลข IMSI → ตรวจ IMSI',
-                '• icc%เลข ICCID → ตรวจเลขซิม',
-                '• web%ชื่อเว็บไซต์ → ตรวจเว็บไซต์',
-                '• dis%พิกัดต้นทาง/พิกัดปลายทาง → ระยะทาง',
-                '• map%ละติจูด,ลองจิจูด → พิกัด MAP',
-                '• lw%คำถาม → ค้นหาข้อกฎหมาย'
-              ]),
-              menuSection('🏪 ร้านค้า / สวัสดิการ', [
-                '• cj%เบอร์ เลขบัตร → สมาชิก CJ',
-                '• se%รหัสสาขา7-11 → สาขาเซเว่น',
-                '• lc%ชื่อ-สกุล,ชื่อบริษัท → ใบอนุญาตบริษัท',
-                '• loa%ชื่อแอป → ตรวจสอบแอปเงินกู้',
-                '• for%เลขนิติ → ทะเบียนพาณิชย์/นิติบุคคล',
-                '• tr%ชื่อผู้ประกอบการ → ผู้ประกอบการขนส่ง',
-                '• cctv%เวลากล้อง,เวลาจริง → เปรียบเทียบเวลากล้อง',
-                '• tisi%เลขมอก. → ตรวจมาตรฐาน มอก.',
-                '• s%เลขบัตร → ผ่อนเครื่องใช้ไฟฟ้า',
-                '• bq%เบอร์โทร/เลขบัตร → ศูนย์บริการรถ'
-              ])
-            ]
-          },
-          footer: buildMenuFooter()
-        },
 
-        {
-          type: 'bubble',
-          size: 'mega',
-          header: {
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: '18px',
+        spacing: 'md',
+
+        contents: [
+          {
+            type: 'text',
+            text: '📋 ระบบตรวจสอบข้อมูลสวัสดิการแห่งรัฐ',
+            weight: 'bold',
+            size: 'md',
+            color: '#111827',
+            wrap: true
+          },
+
+          {
+            type: 'text',
+            text: 'ตรวจสอบสถานะการลงทะเบียนและผลการพิจารณาคุณสมบัติ',
+            size: 'sm',
+            color: '#64748B',
+            wrap: true
+          },
+
+          {
+            type: 'separator',
+            margin: 'md'
+          },
+
+          {
+            type: 'text',
+            text: 'กดปุ่มด้านล่างเพื่อเข้าสู่ระบบตรวจสอบข้อมูล',
+            size: 'xs',
+            color: '#94A3B8',
+            margin: 'md',
+            wrap: true
+          }
+        ]
+      },
+
+
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: '18px',
+
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            height: 'sm',
+
+            action: {
+              type: 'uri',
+              label: '🔎 ตรวจสอบข้อมูล',
+              uri: 'https://liff.line.me/2011072783-J1rW6GAz'
+            }
+          }
+        ]
+      }
+    }
+  };
+}
+
+function buildMoneyFlowMenuFlex() {
+  return {
+    type: 'flex',
+
+    altText: 'ระบบวิเคราะห์เส้นเงิน Money Flow Link',
+
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0F172A',
+        paddingAll: '18px',
+
+        contents: [
+          {
+            type: 'text',
+            text: '💸 ระบบวิเคราะห์เส้นเงิน',
+            color: '#FFFFFF',
+            weight: 'bold',
+            size: 'lg',
+            wrap: true
+          },
+
+          {
+            type: 'text',
+            text: 'MONEY FLOW LINK ANALYSIS',
+            color: '#94A3B8',
+            size: 'xs',
+            margin: 'sm'
+          }
+        ]
+      },
+
+
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: '18px',
+        spacing: 'md',
+
+        contents: [
+          {
+            type: 'text',
+            text: '🔗 วิเคราะห์ความเชื่อมโยงทางการเงิน',
+            weight: 'bold',
+            size: 'md',
+            color: '#111827',
+            wrap: true
+          },
+
+          {
+            type: 'text',
+            text:
+              'วิเคราะห์รายการเงินเข้า เงินออก คู่บัญชี และเส้นทางความเชื่อมโยงจากไฟล์ Statement',
+            size: 'sm',
+            color: '#64748B',
+            wrap: true
+          },
+
+          {
+            type: 'separator',
+            margin: 'md'
+          },
+
+          {
             type: 'box',
             layout: 'vertical',
-            backgroundColor: '#64748B',
-            paddingAll: '16px',
+            spacing: 'sm',
+            margin: 'md',
+
             contents: [
               {
                 type: 'text',
-                text: '📂 NANABOT 5/5',
-                color: '#FFFFFF',
-                weight: 'bold',
-                size: 'lg'
+                text: '📊 สรุปยอดเงินเข้า / เงินออก',
+                size: 'xs',
+                color: '#475569',
+                wrap: true
               },
+
               {
                 type: 'text',
-                text: 'ประเภทรถ / คำสั่งปรับปรุง',
-                color: '#E2E8F0',
-                size: 'sm',
-                margin: 'sm'
+                text: '🏦 วิเคราะห์คู่บัญชีและธนาคาร',
+                size: 'xs',
+                color: '#475569',
+                wrap: true
+              },
+
+              {
+                type: 'text',
+                text: '🔗 Link Network วิเคราะห์เส้นเชื่อมโยง',
+                size: 'xs',
+                color: '#475569',
+                wrap: true
+              },
+
+              {
+                type: 'text',
+                text: '⚡ ตรวจสอบ Rapid Flow',
+                size: 'xs',
+                color: '#475569',
+                wrap: true
               }
             ]
           },
-          body: {
-            type: 'box',
-            layout: 'vertical',
-            spacing: 'md',
-            contents: [
-              menuSection('🚘 ประเภทรถ', [
-                '• 1 รถยนต์นั่งไม่เกิน 7 คน',
-                '• 2 รถยนต์นั่งเกิน 7 คน',
-                '• 3 รถบรรทุกส่วนบุคคล',
-                '• 4 สามล้อส่วนบุคคล',
-                '• 5 รับจ้างระหว่างจังหวัด',
-                '• 6 รับจ้างไม่เกิน 7 คน',
-                '• 7 สี่ล้อเล็กรับจ้าง',
-                '• 8 รับจ้างสามล้อ',
-                '• 9 บริการธุรกิจ',
-                '• 10 บริการทัศนาจร',
-                '• 11 บริการให้เช่า',
-                '• 12 จักรยานยนต์',
-                '• 13 รถแทรกเตอร์',
-                '• 14 รถบดถนน',
-                '• 15 รถใช้ในงานเกษตรกรรม',
-                '• 16 รถพ่วง',
-                '• 17 จักรยานยนต์สาธารณะ',
-                '• 30 รถโดยสารประจำทาง',
-                '• 31 รถขนาดเล็ก',
-                '• 32 โดยสารไม่ประจำทาง',
-                '• 33 โดยสารส่วนบุคคล',
-                '• 34 บรรทุกไม่ประจำทาง',
-                '• 35 บรรทุกส่วนบุคคล'
-              ]),
-              menuSection('🚨Improvement system ', [
-                '• a#',
-                '• fx#'
-              ])
-            ]
-          },
-          footer: buildMenuFooter()
-        }
-      ]
+
+          {
+            type: 'text',
+            text:
+              'สำหรับสมาชิกที่ได้รับการอนุมัติและมีสิทธิ์ใช้งานเท่านั้น',
+            size: 'xs',
+            color: '#94A3B8',
+            margin: 'md',
+            wrap: true
+          }
+        ]
+      },
+
+
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: '18px',
+
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            height: 'sm',
+
+            action: {
+              type: 'uri',
+              label: '🔎 เข้าระบบ Money Flow Link',
+              uri: 'https://memegabot.com/moneyflow'
+            }
+          }
+        ]
+      }
     }
   };
 }
@@ -5096,13 +22413,16 @@ function buildWelcomeWarningFlex() {
     contents: {
       type: 'bubble',
       size: 'mega',
+
       body: {
         type: 'box',
         layout: 'vertical',
         backgroundColor: '#0B0F14',
         paddingAll: '18px',
         spacing: 'md',
+
         contents: [
+
           {
             type: 'text',
             text: '⚠️ ข้อควรปฏิบัติและคำเตือนสำคัญ ⚠️',
@@ -5112,10 +22432,15 @@ function buildWelcomeWarningFlex() {
             wrap: true,
             align: 'center'
           },
+
           {
             type: 'separator',
             color: '#334155'
           },
+
+          // =========================
+          // ข้อ 1
+          // =========================
           {
             type: 'text',
             text: '1️⃣ สิทธิ์การเข้าถึง',
@@ -5123,6 +22448,7 @@ function buildWelcomeWarningFlex() {
             color: '#FFFFFF',
             size: 'sm'
           },
+
           {
             type: 'text',
             text: 'อนุญาตเฉพาะเจ้าหน้าที่ตำรวจที่ปฏิบัติหน้าที่เท่านั้น',
@@ -5130,6 +22456,11 @@ function buildWelcomeWarningFlex() {
             size: 'sm',
             wrap: true
           },
+
+
+          // =========================
+          // ข้อ 2
+          // =========================
           {
             type: 'text',
             text: '2️⃣ วัตถุประสงค์',
@@ -5138,6 +22469,7 @@ function buildWelcomeWarningFlex() {
             size: 'sm',
             margin: 'md'
           },
+
           {
             type: 'text',
             text: 'ข้อมูลนี้มีไว้เพื่อสนับสนุนงานด้านการสืบสวนสอบสวนโดยเฉพาะ',
@@ -5145,14 +22477,20 @@ function buildWelcomeWarningFlex() {
             size: 'sm',
             wrap: true
           },
+
+
+          // =========================
+          // ข้อ 3
+          // =========================
           {
             type: 'text',
-            text: '3️⃣ ข้อเคร่งคัด',
+            text: '3️⃣ ข้อเคร่งครัด',
             weight: 'bold',
             color: '#FFFFFF',
             size: 'sm',
             margin: 'md'
           },
+
           {
             type: 'text',
             text: 'ห้ามคัดลอก เผยแพร่ หรือส่งต่อข้อมูลสู่ภายนอกโดยเด็ดขาด หากฝ่าฝืน ทำการตัดสิทธิ์ในทันที',
@@ -5160,6 +22498,11 @@ function buildWelcomeWarningFlex() {
             size: 'sm',
             wrap: true
           },
+
+
+          // =========================
+          // ข้อ 4
+          // =========================
           {
             type: 'text',
             text: '4️⃣ การยืนยันตัวตน',
@@ -5168,32 +22511,219 @@ function buildWelcomeWarningFlex() {
             size: 'sm',
             margin: 'md'
           },
+
           {
             type: 'text',
-            text: 'ผู้ใช้งานต้องดำเนินการยืนยันตัวตนตามขั้นตอนที่กำหนดให้ครบถ้วนทุกครั้ง',
+            text:
+              'เจ้าหน้าที่ท่านใดที่ต้องการใช้งาน ให้แจ้งข้อมูลโดยความเป็นจริง\n' +
+              'ห้ามแอบอ้างผู้อื่น หรือแจ้งข้อมูลเท็จ หากตรวจพบจะถูกระงับและนำออกจากระบบทันที',
             color: '#CBD5E1',
             size: 'sm',
             wrap: true
+          },
+
+
+          // =========================
+          // ข้อ 5
+          // =========================
+          {
+            type: 'text',
+            text: '5️⃣ สำคัญ',
+            weight: 'bold',
+            color: '#FFCC00',
+            size: 'sm',
+            margin: 'md'
+          },
+
+          {
+            type: 'text',
+            text:
+              'ท่านที่สมัครใหม่ ต้องมีผู้แนะนำเท่านั้น และผู้แนะนำต้องเป็นสมาชิกปัจจุบัน ✅',
+            color: '#FDE68A',
+            size: 'sm',
+            wrap: true
+          },
+
+          {
+            type: 'separator',
+            color: '#334155',
+            margin: 'md'
+          },
+
+          {
+            type: 'text',
+            text:
+              'หากท่านอ่านครบแล้วและต้องการสมัคร กรุณากดปุ่ม “รับทราบกฏของระบบ” ด้านล่าง',
+            color: '#FFFFFF',
+            size: 'sm',
+            weight: 'bold',
+            wrap: true,
+            align: 'center',
+            margin: 'md'
           }
+
         ]
       },
+
+
+      // =========================
+      // FOOTER
+      // =========================
       footer: {
         type: 'box',
         layout: 'vertical',
         backgroundColor: '#0B0F14',
         paddingAll: '16px',
+        spacing: 'sm',
+
         contents: [
+
           {
             type: 'button',
             style: 'primary',
-            color: '#22C55E',
+            color: '#2563EB',
             height: 'sm',
+
+            action: {
+              type: 'message',
+              label: 'รับทราบกฏของระบบ',
+              text: 'รับทราบกฏของระบบ'
+            }
+          },
+
+          {
+            type: 'button',
+            style: 'secondary',
+            height: 'sm',
+
+            action: {
+              type: 'message',
+              label: 'รายการใช้งานในระบบ',
+              text: 'menu%'
+            }
+          },
+
+          {
+            type: 'button',
+            style: 'secondary',
+            height: 'sm',
+
             action: {
               type: 'uri',
               label: 'ติดต่อ ADMIN',
               uri: 'https://line.me/ti/p/mVmD-ncfvU'
             }
           }
+
+        ]
+      }
+    }
+  };
+}
+
+function buildAcknowledgeRulesFlex() {
+  return {
+    type: 'flex',
+
+    altText:
+      'รับทราบกฏของระบบ',
+
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0B0F14',
+        paddingAll: '20px',
+        spacing: 'md',
+
+        contents: [
+
+          {
+            type: 'text',
+            text: '✅ รับทราบกฏของระบบ',
+            weight: 'bold',
+            size: 'xl',
+            color: '#22C55E',
+            align: 'center',
+            wrap: true
+          },
+
+          {
+            type: 'separator',
+            color: '#334155',
+            margin: 'md'
+          },
+
+          {
+            type: 'text',
+            text:
+              'ก่อนลงทะเบียน กรุณาตรวจสอบข้อมูลของท่านให้ถูกต้องและเป็นความจริง',
+            color: '#FFFFFF',
+            size: 'sm',
+            wrap: true,
+            margin: 'md'
+          },
+
+          {
+            type: 'text',
+            text:
+              'ผู้สมัครใหม่ต้องมีผู้แนะนำ และผู้แนะนำต้องเป็นสมาชิกปัจจุบันของระบบ',
+            color: '#CBD5E1',
+            size: 'sm',
+            wrap: true
+          },
+
+          {
+            type: 'text',
+            text:
+              'ห้ามแอบอ้างบุคคลอื่น หรือใช้ข้อมูลอันเป็นเท็จในการสมัคร',
+            color: '#FCA5A5',
+            size: 'sm',
+            wrap: true
+          },
+
+          {
+            type: 'text',
+            text:
+              'เมื่อพร้อมแล้ว กดปุ่มด้านล่างเพื่อเข้าสู่หน้าลงทะเบียนยืนยันตัวตน',
+            color: '#FDE68A',
+            size: 'sm',
+            wrap: true,
+            margin: 'md',
+            align: 'center'
+          }
+
+        ]
+      },
+
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0B0F14',
+        paddingAll: '16px',
+
+        contents: [
+
+          {
+            type: 'button',
+            style: 'primary',
+            color: '#22C55E',
+            height: 'sm',
+
+            action: {
+              type: 'uri',
+
+              label:
+                'ลงทะเบียนยืนยันตัวตนเพื่อใช้งาน',
+
+              uri:
+                'https://memegabot.com/register'
+            }
+          }
+
         ]
       }
     }
@@ -5268,7 +22798,7 @@ color:'#22C55E'
 
 {
 type:'text',
-text:'NANABOT SERVER',
+text:'MEGA SERVER',
 align:'center',
 margin:'md',
 size:'xs',
@@ -5385,6 +22915,41 @@ async function compareFaces(image1Path, image2Path) {
   );
 
   return response.data;
+}
+
+// ===============================
+// สร้างข้อความตอบกลับ dol%
+// ===============================
+function buildOfficeHourSearchMessage(pid) {
+  const now = new Date();
+
+  const dateText = now.toLocaleDateString('en-GB', {
+    timeZone: 'Asia/Bangkok',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric'
+  }).replace(/\//g, '-');
+
+  const timeText = now.toLocaleTimeString('en-GB', {
+    timeZone: 'Asia/Bangkok',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  });
+
+  return (
+    `🔎 PID : ${pid}\n` +
+    `-  -  -  -  -  -  -  -  -\n` +
+    `❌ ไม่พบข้อมูล\n` +
+    `❗ กรุณาดำเนินการสืบค้น\n` +
+    `เฉพาะในช่วงเวลาราชการเท่านั้น\n\n` +
+    `🕘 เปิดให้บริการ : 09:00 น.\n` +
+    `🕞 ปิดให้บริการ : 15:30 น.\n\n` +
+    `⚠️ ไม่สามารถสืบค้นนอกช่วงเวลาที่กำหนดได้\n` +
+    `-  -  -  -  -  -  -  -  -\n` +
+    `🕞วันที่สืบค้น\n` +
+    `#${dateText} ${timeText} นาที`
+  );
 }
 
 function formatFaceCompareResult(data) {
@@ -5722,11 +23287,11 @@ const rows = Array.isArray(res?.data)
 
 if(!rows.length) return '❌ไม่พบข้อมูลทะเบียนรถ';
 
-let msg = `🚗ข้อมูลทะเบียนรถ\n`;
+let msg = `📂ข้อมูลครอบครองรถ\n`;
 
 rows.slice(0,1).forEach((car,index)=>{
 msg += `
-┌●รถคันที่${index+1}
+┌●คันที่${index+1}
 ├●ทะเบียน: ${safeVehicleValue(car?.plate1,'')}${safeVehicleValue(car?.plate2,'')}
 ├●สำนักงาน: ${safeVehicleValue(car?.offLocDesc)}
 ├●ยี่ห้อ: ${safeVehicleValue(car?.brnDesc)}
@@ -5786,99 +23351,128 @@ status: pick('STATUS')
 };
 }
 
-function buildCrimeFlex(result, citizenId){
+function buildCrimeFlex(result, citizenId) {
+  const rows =
+    Array.isArray(result?.data)
+      ? result.data
+      : Array.isArray(result?.data?.data)
+        ? result.data.data
+        : Array.isArray(result?.content)
+          ? result.content
+          : [];
 
-const rows =
-Array.isArray(result?.data) ? result.data :
-Array.isArray(result?.data?.data) ? result.data.data :
-Array.isArray(result?.content) ? result.content :
-[];
+  if (!rows.length) {
+    return {
+      type: 'text',
+      text: '❌ ไม่พบข้อมูลหมายจับ'
+    };
+  }
 
-if(!rows.length){
-return {
-type:'text',
-text:'❌ ไม่พบข้อมูลหมายจับ'
-};
-}
+  const bubbles = rows.slice(0, 10).map((raw, index) => {
+    const item = parseCrimeText(raw);
 
-const bubbles = rows.slice(0,10).map((raw,index)=>{
-const item = parseCrimeText(raw);
+    // เก็บเฉพาะตัวเลขสำหรับใช้โทรออก
+    const phone = String(item.tel || '').replace(/\D/g, '');
 
-return {
-type:'bubble',
-size:'mega',
-header:{
-type:'box',
-layout:'vertical',
-backgroundColor:'#7F1D1D',
-paddingAll:'16px',
-contents:[
-{
-type:'text',
-text:`📂 หมายจับ [CRIME] ${index+1}`,
-weight:'bold',
-size:'lg',
-color:'#FFFFFF'
-},
-{
-type:'text',
-text:item.status || item.warrantStatus || 'ตรวจพบข้อมูล',
-size:'sm',
-color:'#FECACA',
-margin:'sm'
-}
-]
-},
-body:{
-type:'box',
-layout:'vertical',
-spacing:'sm',
-contents:[
-{
-type:'text',
-text:item.name || '-',
-weight:'bold',
-size:'md',
-wrap:true,
-color:'#111827'
-},
-{
-type:'separator',
-margin:'md'
-},
-fieldText('เลขหมายจับ', item.warrant || '-'),
-fieldText('เลขคดี', item.caseNo || '-'),
-fieldText('เลขบัตร', item.id || citizenId || '-'),
-fieldText('ข้อหา', item.charge || '-'),
-fieldText('เจ้าของคดี', item.police || '-'),
-fieldText('เบอร์ติดต่อ', item.tel || '-'),
-fieldText('สถานะหมาย', item.status || '-')
-]
-},
-footer:{
-type:'box',
-layout:'vertical',
-contents:[
-{
-type:'text',
-text:`รายการ ${index+1} จาก ${rows.length}`,
-size:'xs',
-align:'center',
-color:'#6B7280'
-}
-]
-}
-};
-});
+    const footerContents = [];
 
-return {
-type:'flex',
-altText:`พบข้อมูลหมายจับ ${rows.length} รายการ`,
-contents:{
-type:'carousel',
-contents:bubbles
-}
-};
+    // แสดงปุ่มโทรเฉพาะเมื่อมีหมายเลขที่ใช้งานได้
+    if (phone) {
+      footerContents.push({
+        type: 'button',
+        style: 'primary',
+        color: '#DC2626',
+        height: 'sm',
+        action: {
+          type: 'uri',
+          label: '📞 โทรหาเจ้าของคดี',
+          uri: `tel:${phone}`
+        }
+      });
+    }
+
+    footerContents.push({
+      type: 'text',
+      text: `รายการ ${index + 1} จาก ${rows.length}`,
+      size: 'xs',
+      align: 'center',
+      color: '#6B7280',
+      margin: phone ? 'md' : 'none'
+    });
+
+    return {
+      type: 'bubble',
+      size: 'mega',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#7F1D1D',
+        paddingAll: '16px',
+        contents: [
+          {
+            type: 'text',
+            text: `📂 หมายจับ [CRIME] ${index + 1}`,
+            weight: 'bold',
+            size: 'lg',
+            color: '#FFFFFF'
+          },
+          {
+            type: 'text',
+            text:
+              item.status ||
+              item.warrantStatus ||
+              'ตรวจพบข้อมูล',
+            size: 'sm',
+            color: '#FECACA',
+            margin: 'sm',
+            wrap: true
+          }
+        ]
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          {
+            type: 'text',
+            text: item.name || '-',
+            weight: 'bold',
+            size: 'md',
+            wrap: true,
+            color: '#111827'
+          },
+          {
+            type: 'separator',
+            margin: 'md'
+          },
+          fieldText('เลขหมายจับ', item.warrant || '-'),
+          fieldText('เลขคดี', item.caseNo || '-'),
+          fieldText('เลขบัตร', item.id || citizenId || '-'),
+          fieldText('ข้อหา', item.charge || '-'),
+          fieldText('เจ้าของคดี', item.police || '-'),
+          fieldText('เบอร์ติดต่อ', item.tel || '-'),
+          fieldText('สถานะหมาย', item.status || '-')
+        ]
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        paddingAll: '14px',
+        contents: footerContents
+      }
+    };
+  });
+
+  return {
+    type: 'flex',
+    altText: `พบข้อมูลหมายจับ ${rows.length} รายการ`,
+    contents: {
+      type: 'carousel',
+      contents: bubbles
+    }
+  };
 }
 
 function calcDistanceKm(lat1, lon1, lat2, lon2) {
@@ -6185,22 +23779,1914 @@ function packageBubble(days, price, badgeText = '') {
   };
 }
 
+function extraSupportFlex() {
+  return {
+    type: 'carousel',
+    contents: [
+
+      // ==================================================
+      // FLEX 1 : PREMIUM ADD-ON
+      // ==================================================
+      {
+        type: 'bubble',
+        size: 'mega',
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: '#101827',
+          paddingAll: '22px',
+
+          contents: [
+            {
+              type: 'text',
+              text: 'PREMIUM ADD-ON',
+              size: 'xs',
+              weight: 'bold',
+              color: '#F5C451'
+            },
+
+            {
+              type: 'text',
+              text: '🔐 คำสั่งสนับสนุนเพิ่มเติม',
+              size: 'xl',
+              weight: 'bold',
+              color: '#FFFFFF',
+              margin: 'sm',
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: 'เพิ่มสิทธิ์การใช้งานตามบริการที่ต้องการ',
+              size: 'sm',
+              color: '#AAB4C5',
+              margin: 'sm',
+              wrap: true
+            },
+
+            {
+              type: 'separator',
+              color: '#334155',
+              margin: 'xl'
+            },
+
+            // AIS
+            {
+              type: 'box',
+              layout: 'vertical',
+              backgroundColor: '#192436',
+              cornerRadius: 'xl',
+              paddingAll: '18px',
+              margin: 'xl',
+
+              contents: [
+                {
+                  type: 'box',
+                  layout: 'horizontal',
+                  alignItems: 'center',
+
+                  contents: [
+                    {
+                      type: 'box',
+                      layout: 'vertical',
+                      flex: 3,
+
+                      contents: [
+                        {
+                          type: 'text',
+                          text: '📱 AIS',
+                          size: 'lg',
+                          weight: 'bold',
+                          color: '#FFFFFF'
+                        },
+                        {
+                          type: 'text',
+                          text: 'คำสั่งสนับสนุนเพิ่มเติม',
+                          size: 'xs',
+                          color: '#94A3B8',
+                          margin: 'xs'
+                        }
+                      ]
+                    },
+
+                    {
+                      type: 'box',
+                      layout: 'vertical',
+                      flex: 2,
+
+                      contents: [
+                        {
+                          type: 'text',
+                          text: '499 บาท',
+                          size: 'lg',
+                          weight: 'bold',
+                          color: '#F5C451',
+                          align: 'end'
+                        },
+                        {
+                          type: 'text',
+                          text: '/ เดือน',
+                          size: 'xs',
+                          color: '#94A3B8',
+                          align: 'end'
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+
+            // พัสดุหลัก
+            {
+              type: 'box',
+              layout: 'vertical',
+              backgroundColor: '#192436',
+              cornerRadius: 'xl',
+              paddingAll: '18px',
+              margin: 'md',
+
+              contents: [
+                {
+                  type: 'box',
+                  layout: 'horizontal',
+                  alignItems: 'center',
+
+                  contents: [
+                    {
+                      type: 'box',
+                      layout: 'vertical',
+                      flex: 3,
+
+                      contents: [
+                        {
+                          type: 'text',
+                          text: '📦 พัสดุหลัก',
+                          size: 'lg',
+                          weight: 'bold',
+                          color: '#FFFFFF'
+                        },
+                        {
+                          type: 'text',
+                          text: 'คำสั่งพัสดุสำหรับสมาชิก',
+                          size: 'xs',
+                          color: '#94A3B8',
+                          margin: 'xs'
+                        }
+                      ]
+                    },
+
+                    {
+                      type: 'box',
+                      layout: 'vertical',
+                      flex: 2,
+
+                      contents: [
+                        {
+                          type: 'text',
+                          text: '499 บาท',
+                          size: 'lg',
+                          weight: 'bold',
+                          color: '#F5C451',
+                          align: 'end'
+                        },
+                        {
+                          type: 'text',
+                          text: '/ เดือน',
+                          size: 'xs',
+                          color: '#94A3B8',
+                          align: 'end'
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+
+            {
+              type: 'separator',
+              color: '#334155',
+              margin: 'xl'
+            },
+
+            {
+              type: 'text',
+              text: '✦ เลือกเปิดใช้งานเฉพาะบริการที่ต้องการ',
+              size: 'sm',
+              weight: 'bold',
+              color: '#F5C451',
+              align: 'center',
+              margin: 'lg',
+              wrap: true
+            },
+
+            {
+              type: 'box',
+              layout: 'vertical',
+              backgroundColor: '#3A3020',
+              cornerRadius: 'xl',
+              paddingAll: '16px',
+              margin: 'lg',
+
+              contents: [
+                {
+                  type: 'text',
+                  text: '⚠️ ค่าบริการส่วนนี้',
+                  size: 'md',
+                  weight: 'bold',
+                  color: '#F5C451',
+                  align: 'center',
+                  wrap: true
+                },
+
+                {
+                  type: 'text',
+                  text: 'แยกจากแพ็กเกจหลัก',
+                  size: 'xl',
+                  weight: 'bold',
+                  color: '#FFFFFF',
+                  align: 'center',
+                  margin: 'sm',
+                  wrap: true
+                },
+
+                {
+                  type: 'text',
+                  text: 'คิดค่าบริการแยกตามรายการที่เลือก',
+                  size: 'xs',
+                  color: '#D6C79D',
+                  align: 'center',
+                  margin: 'sm',
+                  wrap: true
+                }
+              ]
+            }
+          ]
+        }
+      },
+
+      // ==================================================
+      // FLEX 2 : NETWORK SUPPORT
+      // ==================================================
+      {
+        type: 'bubble',
+        size: 'mega',
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: '#0B1623',
+          paddingAll: '22px',
+
+          contents: [
+            {
+              type: 'text',
+              text: 'NETWORK SUPPORT',
+              size: 'xs',
+              weight: 'bold',
+              color: '#5EEAD4'
+            },
+
+            {
+              type: 'text',
+              text: '📡 สนับสนุนเบท 3 เครือข่าย',
+              size: 'xl',
+              weight: 'bold',
+              color: '#FFFFFF',
+              margin: 'sm',
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: 'เลือกแพ็กเกจตามระยะเวลาที่ต้องการ',
+              size: 'sm',
+              color: '#9CAABD',
+              margin: 'sm',
+              wrap: true
+            },
+
+            {
+              type: 'separator',
+              color: '#26384A',
+              margin: 'xl'
+            },
+
+            {
+              type: 'box',
+              layout: 'vertical',
+              spacing: 'md',
+              margin: 'xl',
+
+              contents: [
+
+                // 1 เดือน
+                {
+                  type: 'box',
+                  layout: 'horizontal',
+                  backgroundColor: '#142536',
+                  cornerRadius: 'lg',
+                  paddingAll: '15px',
+
+                  contents: [
+                    {
+                      type: 'text',
+                      text: '01',
+                      size: 'xs',
+                      weight: 'bold',
+                      color: '#5EEAD4',
+                      flex: 1
+                    },
+                    {
+                      type: 'text',
+                      text: '1 เดือน',
+                      weight: 'bold',
+                      color: '#FFFFFF',
+                      flex: 3
+                    },
+                    {
+                      type: 'text',
+                      text: '3,000 ฿',
+                      weight: 'bold',
+                      color: '#5EEAD4',
+                      align: 'end',
+                      flex: 2
+                    }
+                  ]
+                },
+
+                // 3 เดือน
+                {
+                  type: 'box',
+                  layout: 'horizontal',
+                  backgroundColor: '#142536',
+                  cornerRadius: 'lg',
+                  paddingAll: '15px',
+
+                  contents: [
+                    {
+                      type: 'text',
+                      text: '03',
+                      size: 'xs',
+                      weight: 'bold',
+                      color: '#5EEAD4',
+                      flex: 1
+                    },
+                    {
+                      type: 'text',
+                      text: '3 เดือน',
+                      weight: 'bold',
+                      color: '#FFFFFF',
+                      flex: 3
+                    },
+                    {
+                      type: 'text',
+                      text: '6,000 ฿',
+                      weight: 'bold',
+                      color: '#5EEAD4',
+                      align: 'end',
+                      flex: 2
+                    }
+                  ]
+                },
+
+                // 6 เดือน
+                {
+                  type: 'box',
+                  layout: 'horizontal',
+                  backgroundColor: '#142536',
+                  cornerRadius: 'lg',
+                  paddingAll: '15px',
+
+                  contents: [
+                    {
+                      type: 'text',
+                      text: '06',
+                      size: 'xs',
+                      weight: 'bold',
+                      color: '#5EEAD4',
+                      flex: 1
+                    },
+                    {
+                      type: 'text',
+                      text: '6 เดือน',
+                      weight: 'bold',
+                      color: '#FFFFFF',
+                      flex: 3
+                    },
+                    {
+                      type: 'text',
+                      text: '10,000 ฿',
+                      weight: 'bold',
+                      color: '#5EEAD4',
+                      align: 'end',
+                      flex: 2
+                    }
+                  ]
+                },
+
+                // 12 เดือน
+                {
+                  type: 'box',
+                  layout: 'vertical',
+                  backgroundColor: '#173B3C',
+                  cornerRadius: 'xl',
+                  paddingAll: '16px',
+
+                  contents: [
+                    {
+                      type: 'box',
+                      layout: 'horizontal',
+
+                      contents: [
+                        {
+                          type: 'text',
+                          text: '⭐ 12 เดือน',
+                          weight: 'bold',
+                          size: 'md',
+                          color: '#FFFFFF',
+                          flex: 3
+                        },
+                        {
+                          type: 'text',
+                          text: '15,000 ฿',
+                          weight: 'bold',
+                          size: 'lg',
+                          color: '#5EEAD4',
+                          align: 'end',
+                          flex: 2
+                        }
+                      ]
+                    },
+
+                    {
+                      type: 'text',
+                      text: 'แพ็กเกจระยะยาว',
+                      size: 'xs',
+                      color: '#A7F3D0',
+                      margin: 'sm'
+                    }
+                  ]
+                }
+              ]
+            },
+
+            {
+              type: 'separator',
+              color: '#26384A',
+              margin: 'xl'
+            },
+
+            {
+              type: 'text',
+              text: '◆ NETWORK SUPPORT PACKAGE ◆',
+              size: 'xs',
+              weight: 'bold',
+              color: '#5EEAD4',
+              align: 'center',
+              margin: 'lg'
+            },
+
+            {
+              type: 'text',
+              text: 'รองรับการสนับสนุนเบท 3 เครือข่าย',
+              size: 'xs',
+              color: '#7F8FA3',
+              align: 'center',
+              margin: 'xs',
+              wrap: true
+            }
+          ]
+        }
+      }
+    ]
+  };
+}
+
+function formatBankBOT(data, keyword) {
+  if (!data?.success || !data?.results?.length) {
+    return '❌ ไม่พบข้อมูล สืบค้นใหม่อีกครั้ง';
+  }
+
+  let msg = `🏦 ผลการค้นหา: ${keyword}\n`;
+  msg += `- - - - - - - - - -\n`;
+
+  data.results.forEach((item, index) => {
+    msg += `
+รายการ ${index + 1}
+🏦 ธนาคาร: ${item.institutionNameThai || '-'}
+🔢 รหัสธนาคาร: ${item.bankCode || '-'}
+📋 สถานะ: ${item.closeDate || '-'}
+📍 ที่อยู่: ${item.institutionAddressThai || '-'}
+☎️ โทร: ${item.telephone || '-'}
+🌐 เว็บไซต์: ${item.institutionUrl || '-'}
+- - - - - - - - - -`;
+  });
+
+  return msg.trim();
+}
+
+async function searchBankBOT(keyword) {
+  const key = String(keyword || '').trim();
+
+  const isBankCode = /^\d{3,4}$/.test(key);
+  const searchValue = isBankCode
+    ? key.padStart(4, '0')
+    : key;
+
+  const encoded = encodeURIComponent(searchValue);
+
+  const url =
+    'https://www.bot.or.th/content/bot/th/fi-list/jcr:content/root/container/involvepartyopenlist.InvolvePartyOpenListingResultsBank.10.p0.BANK_CODE.inst0.paysys0.status0.' +
+    encoded +
+    '.ascending.json';
+
+  const res = await axios.get(url, {
+    timeout: 15000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Accept': 'application/json'
+    }
+  });
+
+  return res.data;
+}
+
+async function searchSeven(storeId) {
+
+  const { data } = await axios.get(
+    `http://151.246.242.113:2266/?se=${encodeURIComponent(storeId)}&key=qYFlSvOoq0shlfbNWUzLlqZx`,
+    {
+      timeout: 15000
+    }
+  );
+
+  if (!data?.success || !data?.data) {
+    return '❌ ไม่พบข้อมูลสาขา';
+  }
+
+  const shop = data.data;
+
+  const branchCode = shop.branchCode || '-';
+  const address = shop.address || '-';
+  const lineUrl = shop.line || '-';
+
+  const parts = branchCode.split(' ');
+  const storeIdOnly = parts.shift() || '-';
+  const storeName = parts.join(' ') || '-';
+
+  const lineId = lineUrl.match(/@[\w-]+/i)?.[0] || '-';
+
+  return `🏪 ข้อมูลสาขา 7-Eleven
+
+🆔 รหัสสาขา: ${storeIdOnly}
+🏬 ชื่อสาขา: ${storeName}
+
+📍 ที่อยู่:
+${address}
+
+💬 LINE Official: ${lineId}
+
+🔗 เพิ่มเพื่อน LINE:
+${lineUrl}`;
+}
+
+async function searchJunkCall(phone) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+
+    if (!/^0\d{8,9}$/.test(cleanPhone)) {
+      return '❌ รูปแบบเบอร์โทรไม่ถูกต้อง';
+    }
+
+    const url =
+      `https://junkcall.org/th/?q=${encodeURIComponent(cleanPhone)}`;
+
+    const response = await axios.get(url, {
+      timeout: 20000,
+
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+          'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+          'Chrome/151.0.0.0 Safari/537.36',
+
+        'Accept':
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+
+        'Accept-Language':
+          'th-TH,th;q=0.9,en;q=0.8'
+      },
+
+      maxRedirects: 5
+    });
+
+    const html = String(response.data || '');
+
+    // ตรวจกรณี JunkCall เปิด bot verification
+    if (
+      /verify that you're not a robot/i.test(html) ||
+      /javascript is disabled/i.test(html)
+    ) {
+      return (
+        '⚠️ JunkCall ปฏิเสธการค้นหาจาก Server ชั่วคราว\n' +
+        `🔗 ${url}`
+      );
+    }
+
+    const $ = cheerio.load(html);
+
+    const bodyText = $('body')
+      .text()
+      .replace(/\r/g, '')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n\s+/g, '\n')
+      .trim();
+
+    console.log('JUNKCALL BODY:', bodyText.slice(0, 4000));
+
+    // ดึงจำนวนที่เห็นในตาราง
+    const unknownMatch =
+      bodyText.match(/ไม่รู้จัก\s*(\d+)/i);
+
+    const waitingMatch =
+      bodyText.match(/รอการยืนยัน\s*(\d+)/i);
+
+    const whitelistMatch =
+      bodyText.match(/บัญชีขาว\s*(\d+)/i);
+
+    const policeMatch =
+      bodyText.match(/ตำรวจ\s*(\d+)/i);
+
+    const unknown = unknownMatch?.[1] || '0';
+    const waiting = waitingMatch?.[1] || '0';
+    const whitelist = whitelistMatch?.[1] || '0';
+    const police = policeMatch?.[1] || '0';
+
+    const total =
+      Number(unknown) +
+      Number(waiting) +
+      Number(whitelist);
+
+    return (
+      `📞 JUNKCALL\n` +
+      `-------------------\n` +
+      `📱 หมายเลข: ${cleanPhone}\n\n` +
+
+      `📊 ผลการค้นหา\n` +
+      `├ ไม่รู้จัก: ${unknown}\n` +
+      `├ รอการยืนยัน: ${waiting}\n` +
+      `└ บัญชีขาว: ${whitelist}\n\n` +
+
+      `🚨 รายละเอียด\n` +
+      `└ ตำรวจ: ${police}\n\n` +
+
+      `📌 จำนวนรายงาน: ${total}`
+    );
+
+  } catch (err) {
+    console.error(
+      'JunkCall error:',
+      err.response?.status,
+      err.response?.data || err.message
+    );
+
+    return '❌ ไม่สามารถค้นหา JunkCall ได้ในขณะนี้';
+  }
+}
+
+// =========================
+// kp% ตรวจสอบสถานภาพสมาชิก สก.ทบ.
+// =========================
+const RTA_MEMBER_API_URL = 'http://rtacs.chapanakit-rta.com/checkmemberstatus/MemberStatus.php';
+
+const THAI_MONTH_NAMES = [
+  'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
+  'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'
+];
+
+const THAI_MONTH_SHORT = [
+  'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.',
+  'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'
+];
+
+async function fetchRtaMemberStatus(id) {
+  const resp = await axios.post(
+    RTA_MEMBER_API_URL,
+    new URLSearchParams({ id: String(id).trim() }).toString(),
+    {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36'
+      },
+      timeout: 30000
+    }
+  );
+  return String(resp.data || '');
+}
+
+function rtaClean(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function rtaDateDMY(text) {
+  const m = String(text || '').match(/(\d{1,2})\s+([\u0E00-\u0E7F]+)\s+พ\.ศ\.\s*(\d{4})/);
+  if (!m) return rtaClean(text);
+  const day = m[1].padStart(2, '0');
+  const monthIndex = THAI_MONTH_NAMES.indexOf(m[2]);
+  const month = monthIndex >= 0 ? String(monthIndex + 1).padStart(2, '0') : m[2];
+  return `${day}/${month}/${m[3]}`;
+}
+
+function rtaMonthYear(text) {
+  return rtaClean(text).replace(/พ\.ศ\.\s*/g, '').trim();
+}
+
+function rtaShortMonthYear(text) {
+  const m = String(text || '').match(/([\u0E00-\u0E7F]+)\s+พ\.ศ\.\s*(\d{4})/);
+  if (!m) return rtaClean(text);
+  const monthIndex = THAI_MONTH_NAMES.indexOf(m[1]);
+  const month = monthIndex >= 0 ? THAI_MONTH_SHORT[monthIndex] : m[1];
+  return `${month} ${m[2]}`;
+}
+
+function rtaAddressLine(fieldValue) {
+  const value = rtaClean(fieldValue);
+  if (!value) return '';
+
+  const grab = (re) => {
+    const m = value.match(re);
+    return m ? m[1].trim() : '';
+  };
+
+  const no = grab(/เลขที่\s*([^\s]+)/);
+  const moo = grab(/หมู่\s*([^\s]+)/);
+  const soi = grab(/ซอย\s*([^\s]+)/);
+  const road = grab(/ถนน\s*([^\s]+)/);
+  const tambol = grab(/ตำบล\/แขวง\s*(.+?)(?=\s+(?:อำเภอ\/เขต|รหัสไปรษณีย์)|$)/);
+  const amphur = grab(/อำเภอ\/เขต\s*(.+?)(?=\s+(?:จังหวัด|รหัสไปรษณีย์)|$)/);
+  const province = grab(/จังหวัด\s*(.+?)(?=\s+(?:รหัสไปรษณีย์)|$)/);
+  const zip = grab(/รหัสไปรษณีย์\s*([^\s]+)/);
+
+  const isBangkok = /กรุงเทพ/.test(province);
+
+  const parts = [];
+  if (no && no !== '-') parts.push(no);
+  if (moo && moo !== '-') parts.push(`ม.${moo}`);
+  if (road && road !== '-') parts.push(`ถ.${road}`);
+  if (soi && soi !== '-') parts.push(`ซ.${soi}`);
+  if (tambol && tambol !== '-') parts.push(`${isBangkok ? 'แขวง' : 'ต.'}${tambol}`);
+  if (amphur && amphur !== '-') parts.push(`${isBangkok ? 'เขต' : 'อ.'}${amphur}`);
+  if (province && province !== '-') parts.push(isBangkok ? province : `จ.${province}`);
+  if (zip && zip !== '-') parts.push(zip);
+
+  return parts.join(' ');
+}
+
+async function lookupUnwiredCell(radio, mcc, mnc, lac, cid) {
+  try {
+    const { data } = await axios.post(
+      UNWIREDLABS_URL,
+      {
+        token: UNWIREDLABS_TOKEN,
+        radio,
+        mcc: Number(mcc),
+        mnc: Number(mnc),
+
+        cells: [
+          {
+            lac: Number(lac),
+            cid: Number(cid)
+          }
+        ],
+
+        address: 1
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        timeout: 20000
+      }
+    );
+
+    return data;
+
+  } catch (err) {
+    console.log(
+      `Unwired ${radio} error:`,
+      err.response?.data || err.message
+    );
+
+    return null;
+  }
+}
+
+
+async function autoLookupUnwiredCell(mcc, mnc, lac, cid) {
+
+  // ลอง 3G ก่อน
+  const umts = await lookupUnwiredCell(
+    'umts',
+    mcc,
+    mnc,
+    lac,
+    cid
+  );
+
+  if (umts?.status === 'ok') {
+    return {
+      radio: '3G / UMTS',
+      data: umts
+    };
+  }
+
+  // ถ้า 3G ไม่พบ ลอง LTE
+  const lte = await lookupUnwiredCell(
+    'lte',
+    mcc,
+    mnc,
+    lac,
+    cid
+  );
+
+  if (lte?.status === 'ok') {
+    return {
+      radio: '4G / LTE',
+      data: lte
+    };
+  }
+
+  return {
+    radio: null,
+    data: lte || umts
+  };
+}
+
+function rtaWrapLines(text, max = 48) {
+  if (!text) return [];
+  const words = String(text).split(' ');
+  const lines = [];
+  let line = '';
+
+  words.forEach(word => {
+    const candidate = (line + ' ' + word).trim();
+    if (line && candidate.length > max) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = candidate;
+    }
+  });
+
+  if (line) lines.push(line);
+  return lines;
+}
+
+function buildOfficeHourSearchFlex(pid) {
+  const now = new Date();
+
+  const dateText = now.toLocaleDateString('en-GB', {
+    timeZone: 'Asia/Bangkok',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric'
+  }).replace(/\//g, '-');
+
+  const timeText = now.toLocaleTimeString('en-GB', {
+    timeZone: 'Asia/Bangkok',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  });
+
+  return {
+    type: 'flex',
+    altText: `ผลการตรวจสอบ PID ${pid}`,
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0F172A',
+        paddingAll: '18px',
+        contents: [
+          {
+            type: 'text',
+            text: `🔎 PID : ${pid}`,
+            color: '#FFFFFF',
+            weight: 'bold',
+            size: 'lg',
+            wrap: true
+          }
+        ]
+      },
+
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: '18px',
+        spacing: 'md',
+        contents: [
+          {
+            type: 'text',
+            text: '❌ ไม่พบข้อมูล',
+            weight: 'bold',
+            size: 'md',
+            color: '#DC2626'
+          },
+
+          {
+            type: 'separator',
+            margin: 'md'
+          },
+
+          {
+            type: 'text',
+            text: '❗ กรุณาดำเนินการสืบค้น\nเฉพาะในช่วงเวลาราชการเท่านั้น',
+            wrap: true,
+            size: 'sm',
+            color: '#334155',
+            margin: 'md'
+          },
+
+          {
+            type: 'box',
+            layout: 'vertical',
+            spacing: 'sm',
+            margin: 'md',
+            contents: [
+              {
+                type: 'text',
+                text: '🕘 เปิดให้บริการ : 09:00 น.',
+                size: 'sm',
+                color: '#334155'
+              },
+              {
+                type: 'text',
+                text: '🕞 ปิดให้บริการ : 15:30 น.',
+                size: 'sm',
+                color: '#334155'
+              }
+            ]
+          },
+
+          {
+            type: 'text',
+            text: '⚠️ ไม่สามารถสืบค้นนอกช่วงเวลาที่กำหนดได้',
+            wrap: true,
+            size: 'sm',
+            color: '#B45309',
+            margin: 'md'
+          },
+
+          {
+            type: 'separator',
+            margin: 'md'
+          },
+
+          {
+            type: 'text',
+            text: `🕞 วันที่สืบค้น\n#${dateText} ${timeText} นาที`,
+            wrap: true,
+            size: 'sm',
+            color: '#475569',
+            margin: 'md'
+          }
+        ]
+      }
+    }
+  };
+}
+
+function formatRtaMemberStatus(html, queryId) {
+  const $ = cheerio.load(html || '');
+
+  const fields = {};
+  $('lable.text-success').each((_, el) => {
+    const label = rtaClean($(el).text());
+    const valueDiv = $(el).next('div');
+    const spanText = rtaClean(valueDiv.find('span.block').first().text());
+    const directText = rtaClean(valueDiv.clone().children().remove().end().text());
+    fields[label] = spanText || directText;
+  });
+
+  const memberNo = fields['เลขทะเบียนสมาชิก'] || queryId;
+
+  const tables = $('table').toArray();
+  const readRows = (tableEl) => {
+    const rows = [];
+    $(tableEl).find('tbody tr').each((_, tr) => {
+      const cells = $(tr).find('td').map((_, td) => rtaClean($(td).text())).get();
+      rows.push(cells);
+    });
+    return rows;
+  };
+
+  let billing = [];
+  let overdue = [];
+  let history = [];
+
+  tables.forEach((tableEl) => {
+    const header = rtaClean($(tableEl).find('thead').text());
+    if (!header) return;
+    if (header.includes('จำนวนเงินที่ค้าง')) {
+      overdue = readRows(tableEl);
+    } else if (header.includes('จำนวนเงิน')) {
+      const theadClass = rtaClean($(tableEl).find('thead tr').attr('class') || '');
+      if (theadClass.includes('info')) {
+        history = readRows(tableEl);
+      } else {
+        billing = readRows(tableEl);
+      }
+    }
+  });
+
+  if (!memberNo && !billing.length && !history.length) {
+    return `❌ ไม่พบข้อมูลสมาชิกเลขที่ ${queryId}`;
+  }
+
+  const id = (fields['เลขประจำตัวประชาชน'] || '-').replace(/-/g, '');
+  const name = fields['ชื่อ - สกุล'] || '-';
+  const birth = rtaDateDMY(fields['วันเกิด']);
+  const gender = fields['เพศ'] || '-';
+  const unit = fields['หน่วยต้นสังกัด'] || 'ไม่ระบุ';
+  const memberSince = rtaDateDMY(fields['เป็นสมาชิกตั้งแต่']);
+  const payMethod = fields['วิธีการชำระ'] || '-';
+  const status = fields['สถานะสมาชิก'] || '-';
+  const memberAddrLines = rtaWrapLines(rtaAddressLine(fields['ที่อยู่สำหรับติดต่อ']));
+
+  const receiverName = fields['ผู้รับเงินสงเคราะห์'] || '-';
+  const receiverAddrLines = rtaWrapLines(rtaAddressLine(fields['ที่อยู่ผู้รับเงินสงเคราะห์']));
+
+  const billingRow = billing[0] || [];
+  const billingMonth = billingRow[0] ? rtaMonthYear(billingRow[0]) : '-';
+  const billingAmount = billingRow[1] || '-';
+
+  const overdueStatus = overdue.length && !/ไม่มียอดค้างชำระ/.test(overdue[0].join(' '))
+    ? `⚠️ มียอดค้างชำระ ${overdue.length} งวด`
+    : '✅ ไม่มีงวดค้างชำระ';
+
+  const historyLines = history.map((row, i) => {
+    const isLast = i === history.length - 1;
+    const month = row[0] ? rtaShortMonthYear(row[0]) : '-';
+    const amount = row[1] || '-';
+    return `${isLast ? '┗' : '┣'} 📅 ${month} ━ ${amount} บาท`;
+  });
+
+  let total = 0;
+  history.forEach(row => {
+    const n = Number(String(row[1] || '').replace(/,/g, ''));
+    if (Number.isFinite(n)) total += n;
+  });
+  const totalText = total.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+
+  const lines = [];
+  lines.push('👤 ข้อมูลสมาชิก');
+  lines.push(`┣ เลขทะเบียนสมาชิก: ${memberNo}`);
+  lines.push(`┣ ชื่อ: ${name}`);
+  if (id && id !== '-') lines.push(`┣ ID: ${id}`);
+  if (birth && birth !== '-') lines.push(`┣ วันเกิด: ${birth}`);
+  if (gender && gender !== '-') lines.push(`┣ เพศ: ${gender}`);
+  lines.push(`┣ หน่วยต้นสังกัด: ${unit}`);
+  if (memberAddrLines.length) {
+    lines.push('┣ ที่อยู่สำหรับติดต่อ:');
+    memberAddrLines.forEach(addrLine => lines.push(`┃ ${addrLine}`));
+  }
+  if (memberSince && memberSince !== '-') lines.push(`┣ 📅 เป็นสมาชิกตั้งแต่: ${memberSince}`);
+  if (payMethod && payMethod !== '-') {
+    lines.push('┣ 💳 วิธีการชำระ:');
+    lines.push(`┃ ${payMethod}`);
+  }
+  lines.push(`┗ ✅ สถานะสมาชิก: ${status}`);
+
+  if (receiverName && receiverName !== '-') {
+    lines.push('');
+    lines.push('👩 ผู้รับเงินสงเคราะห์');
+    lines.push(`┣ ชื่อ: ${receiverName}`);
+    if (receiverAddrLines.length) {
+      lines.push('┗ ที่อยู่:');
+      receiverAddrLines.forEach(addrLine => lines.push(`  ${addrLine}`));
+    }
+  }
+
+  lines.push('');
+  lines.push('💰 เรียกเก็บเงินสงเคราะห์');
+  lines.push(`┣ 📅 งวดเดือน: ${billingMonth}`);
+  lines.push(`┣ 💵 จำนวนเงิน: ${billingAmount} บาท`);
+  lines.push(`┗ 📌 สถานะค้างชำระ: ${overdueStatus}`);
+
+  if (historyLines.length) {
+    lines.push('');
+    lines.push('📊 ประวัติชำระย้อนหลัง 12 เดือน');
+    lines.push(...historyLines);
+    lines.push('');
+    lines.push(`💵 รวมยอดชำระ 12 เดือน: ${totalText} บาท`);
+  }
+
+  return limitLineMessage(lines.join('\n'));
+}
+
+// =====================================
+// DLA WELFARE
+// ระบบตรวจสอบข้อมูลเบี้ยยังชีพ
+// =====================================
+
+async function fetchDlaWelfare(citizenId) {
+
+  const url =
+    'https://welfare.dla.go.th/webview/';
+
+  const commonHeaders = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154 Safari/537.36',
+
+    'Accept':
+      'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+
+    'Accept-Language':
+      'th,en;q=0.9',
+
+    'Referer':
+      url
+  };
+
+
+  // =====================================
+  // เปิดหน้าก่อน เพื่อรับ Session Cookie
+  // =====================================
+
+  const firstResponse =
+    await axios.get(
+      url,
+      {
+        headers:
+          commonHeaders,
+
+        timeout:
+          30000
+      }
+    );
+
+
+  const setCookies =
+    firstResponse.headers[
+      'set-cookie'
+    ] || [];
+
+
+  const cookie =
+    setCookies
+      .map(item =>
+        String(item)
+          .split(';')[0]
+      )
+      .join('; ');
+
+
+  // =====================================
+  // ส่งเลขบัตรไปค้นหา
+  // =====================================
+
+  const form =
+    new URLSearchParams();
+
+  form.append(
+    'citizenId',
+    citizenId
+  );
+
+
+  const response =
+    await axios.post(
+      url,
+
+      form.toString(),
+
+      {
+        timeout:
+          30000,
+
+        responseType:
+          'text',
+
+        headers: {
+          ...commonHeaders,
+
+          'Content-Type':
+            'application/x-www-form-urlencoded',
+
+          'Origin':
+            'https://welfare.dla.go.th',
+
+          ...(cookie
+            ? {
+                Cookie:
+                  cookie
+              }
+            : {})
+        }
+      }
+    );
+
+
+  return response.data;
+}
+
+
+// =====================================
+// อ่านผล HTML
+// =====================================
+
+function parseDlaWelfare(
+  html,
+  citizenId
+) {
+
+  const $ =
+    cheerio.load(
+      String(html || '')
+    );
+
+
+  const bodyText =
+    $('body')
+      .text()
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n\s*\n/g, '\n')
+      .trim();
+
+
+  const found =
+    bodyText.includes(
+      'พบข้อมูลของผู้มีสิทธิ์ได้รับเบี้ยยังชีพ'
+    );
+
+
+  // =====================================
+  // ไม่พบข้อมูล
+  // =====================================
+
+  if (!found) {
+
+    const errorText =
+      $('.fieldBoldRed')
+        .first()
+        .text()
+        .replace(/\s+/g, ' ')
+        .trim();
+
+
+    return (
+`🏛️ ตรวจสอบข้อมูลเบี้ยยังชีพ
+
+🪪 เลขบัตร : ${citizenId}
+
+❌ ${
+  errorText ||
+  'ไม่พบข้อมูลของผู้มีสิทธิ์ได้รับเบี้ยยังชีพ'
+}`
+    );
+  }
+
+
+  // =====================================
+  // พบข้อมูล
+  // =====================================
+
+  let localOrg = '';
+  let district = '';
+  let province = '';
+  let phone = '';
+
+
+  $('span').each(
+    (_, element) => {
+
+      const value =
+        $(element)
+          .text()
+          .replace(/\s+/g, ' ')
+          .trim();
+
+
+      if (
+        value.startsWith('อปท:')
+      ) {
+
+        localOrg =
+          value
+            .replace(
+              /^อปท:\s*/,
+              ''
+            )
+            .trim();
+      }
+
+
+      else if (
+        value.startsWith('อำเภอ:')
+      ) {
+
+        district =
+          value
+            .replace(
+              /^อำเภอ:\s*/,
+              ''
+            )
+            .trim();
+      }
+
+
+      else if (
+        value.startsWith('จังหวัด:')
+      ) {
+
+        province =
+          value
+            .replace(
+              /^จังหวัด:\s*/,
+              ''
+            )
+            .trim();
+      }
+
+
+      else if (
+        value.startsWith('เบอร์ติดต่อ:')
+      ) {
+
+        phone =
+          value
+            .replace(
+              /^เบอร์ติดต่อ:\s*/,
+              ''
+            )
+            .trim();
+      }
+
+    }
+  );
+
+
+  return (
+`🏛️ ข้อมูลผู้มีสิทธิ์ได้รับเบี้ยยังชีพ
+
+✅ พบข้อมูล
+
+🪪 เลขบัตร : ${citizenId}
+
+🏢 อปท. : ${localOrg || '-'}
+📍 อำเภอ : ${district || '-'}
+🗺️ จังหวัด : ${province || '-'}
+☎️ เบอร์ติดต่อ : ${phone || '-'}`
+  );
+}
+
 async function handleText(event) {
   const userId = event.source.userId;
   const text = (event.message.text || '').trim();
 
+// =====================================
+  // ข้อมูลสมาชิกผู้สืบค้น
+  // =====================================
+  const db =
+    loadDB();
+
+  const member =
+    db.members?.[userId] || null;
+
+    if (
+  text === 'รับทราบกฏของระบบ'
+) {
+
+  return reply(
+    event.replyToken,
+    buildAcknowledgeRulesFlex()
+  );
+
+}
+
+// =====================================
+// ADMIN : ระงับ t#
+// ตัวอย่าง ระงับt#0812345678
+// =====================================
+if (
+  text
+    .toLowerCase()
+    .startsWith('ระงับt#')
+) {
+
+  if (!ADMIN_IDS.includes(userId)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ คำสั่งนี้สำหรับแอดมินเท่านั้น'
+    });
+  }
+
+  const phone =
+    text
+      .replace(/^ระงับt#/i, '')
+      .trim()
+      .replace(/\D/g, '');
+
+  if (!/^0\d{9}$/.test(phone)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+`❌ กรุณาระบุเบอร์สมาชิก 10 หลัก
+
+ตัวอย่าง
+ระงับt#0812345678`
+    });
+  }
+
+  const memberEntry =
+    Object.entries(db.members || {})
+      .find(([uid, m]) => {
+
+        const memberPhone =
+          String(
+            m?.phone ||
+            m?.tel ||
+            m?.mobile ||
+            ''
+          )
+            .replace(/\D/g, '');
+
+        return memberPhone === phone;
+      });
+
+  if (!memberEntry) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+`❌ ไม่พบสมาชิก
+
+📱 เบอร์ : ${phone}`
+    });
+  }
+
+  const [
+    targetUserId,
+    targetMember
+  ] = memberEntry;
+
+  db.tBlocked =
+    db.tBlocked || {};
+
+  db.tBlocked[targetUserId] =
+    true;
+
+  saveDB(db);
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text:
+`⛔ ระงับคำสั่ง t# เรียบร้อย
+
+👤 สมาชิก : ${
+  targetMember?.fullname ||
+  targetMember?.fullName ||
+  '-'
+}
+📱 เบอร์ : ${phone}
+
+สมาชิกจะไม่สามารถใช้งานคำสั่ง t# ได้`
+  });
+}
+
+
+// =====================================
+// ADMIN : ปลดระงับ t#
+// ตัวอย่าง ปลดt#0812345678
+// =====================================
+if (
+  text
+    .toLowerCase()
+    .startsWith('ปลดt#')
+) {
+
+  if (!ADMIN_IDS.includes(userId)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ คำสั่งนี้สำหรับแอดมินเท่านั้น'
+    });
+  }
+
+  const phone =
+    text
+      .replace(/^ปลดt#/i, '')
+      .trim()
+      .replace(/\D/g, '');
+
+  if (!/^0\d{9}$/.test(phone)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+`❌ กรุณาระบุเบอร์สมาชิก 10 หลัก
+
+ตัวอย่าง
+ปลดt#0812345678`
+    });
+  }
+
+  const memberEntry =
+    Object.entries(db.members || {})
+      .find(([uid, m]) => {
+
+        const memberPhone =
+          String(
+            m?.phone ||
+            m?.tel ||
+            m?.mobile ||
+            ''
+          )
+            .replace(/\D/g, '');
+
+        return memberPhone === phone;
+      });
+
+  if (!memberEntry) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+`❌ ไม่พบสมาชิก
+
+📱 เบอร์ : ${phone}`
+    });
+  }
+
+  const [
+    targetUserId,
+    targetMember
+  ] = memberEntry;
+
+  db.tBlocked =
+    db.tBlocked || {};
+
+  delete db.tBlocked[
+    targetUserId
+  ];
+
+  saveDB(db);
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text:
+`✅ ปลดระงับคำสั่ง t# เรียบร้อย
+
+👤 สมาชิก : ${
+  targetMember?.fullname ||
+  targetMember?.fullName ||
+  '-'
+}
+📱 เบอร์ : ${phone}
+
+สมาชิกสามารถใช้งานคำสั่ง t# ได้ตามปกติ`
+  });
+}
+
+
+  // =====================================
+  // เปิด Search Audit อัตโนมัติ
+  // =====================================
+  if (
+    event.replyToken &&
+    member &&
+    shouldAddSearchAudit(text)
+  ) {
+
+    SEARCH_AUDIT_CONTEXT.set(
+      event.replyToken,
+      member
+    );
+  }
+
+// =====================================
+// ADMIN : ระงับ SI
+// ตัวอย่าง ระงับsi#0812345678
+// =====================================
+if (
+  text
+    .toLowerCase()
+    .startsWith('ระงับsi#')
+) {
+
+  if (!ADMIN_IDS.includes(userId)) {
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text: '❌ คำสั่งนี้สำหรับแอดมินเท่านั้น'
+      }
+    );
+  }
+
+
+  const phone =
+    text
+      .replace(/^ระงับsi#/i, '')
+      .trim()
+      .replace(/\D/g, '');
+
+
+  if (!/^0\d{9}$/.test(phone)) {
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`❌ กรุณาระบุเบอร์สมาชิก 10 หลัก
+
+ตัวอย่าง
+ระงับsi#0812345678`
+      }
+    );
+  }
+
+
+  // หาเจ้าของเบอร์ในสมาชิก
+  const memberEntry =
+    Object.entries(
+      db.members || {}
+    )
+      .find(([uid, m]) => {
+
+        const memberPhone =
+          String(
+            m?.phone ||
+            m?.tel ||
+            m?.mobile ||
+            ''
+          )
+            .replace(/\D/g, '');
+
+        return memberPhone === phone;
+      });
+
+
+  if (!memberEntry) {
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`❌ ไม่พบสมาชิก
+
+📱 เบอร์ : ${phone}`
+      }
+    );
+  }
+
+
+  const [
+    targetUserId,
+    targetMember
+  ] = memberEntry;
+
+
+  db.siBlocked =
+    db.siBlocked || {};
+
+
+  db.siBlocked[phone] =
+    true;
+
+
+  saveDB(db);
+
+
+  return reply(
+    event.replyToken,
+    {
+      type: 'text',
+      text:
+`⛔ ระงับคำสั่ง si% เรียบร้อย
+
+👤 สมาชิก : ${
+  targetMember?.fullname ||
+  targetMember?.fullName ||
+  '-'
+}
+📱 เบอร์ : ${phone}
+
+สมาชิกจะไม่สามารถใช้งานคำสั่ง si% ได้`
+    }
+  );
+}
+
+
+// =====================================
+// ADMIN : ปลดระงับ SI
+// ตัวอย่าง ปลดsi#0812345678
+// =====================================
+if (
+  text
+    .toLowerCase()
+    .startsWith('ปลดsi#')
+) {
+
+  if (!ADMIN_IDS.includes(userId)) {
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text: '❌ คำสั่งนี้สำหรับแอดมินเท่านั้น'
+      }
+    );
+  }
+
+
+  const phone =
+    text
+      .replace(/^ปลดsi#/i, '')
+      .trim()
+      .replace(/\D/g, '');
+
+
+  if (!/^0\d{9}$/.test(phone)) {
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`❌ กรุณาระบุเบอร์สมาชิก 10 หลัก
+
+ตัวอย่าง
+ปลดsi#0812345678`
+      }
+    );
+  }
+
+
+  const memberEntry =
+    Object.entries(
+      db.members || {}
+    )
+      .find(([uid, m]) => {
+
+        const memberPhone =
+          String(
+            m?.phone ||
+            m?.tel ||
+            m?.mobile ||
+            ''
+          )
+            .replace(/\D/g, '');
+
+        return memberPhone === phone;
+      });
+
+
+  if (!memberEntry) {
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`❌ ไม่พบสมาชิก
+
+📱 เบอร์ : ${phone}`
+      }
+    );
+  }
+
+
+  const [
+    targetUserId,
+    targetMember
+  ] = memberEntry;
+
+
+  db.siBlocked =
+    db.siBlocked || {};
+
+
+  delete db.siBlocked[phone];
+
+
+  saveDB(db);
+
+
+  return reply(
+    event.replyToken,
+    {
+      type: 'text',
+      text:
+`✅ ปลดระงับคำสั่ง si% เรียบร้อย
+
+👤 สมาชิก : ${
+  targetMember?.fullname ||
+  targetMember?.fullName ||
+  '-'
+}
+📱 เบอร์ : ${phone}
+
+สมาชิกสามารถใช้งานคำสั่ง si% ได้ตามปกติ`
+    }
+  );
+}
+
+ // ===============================
+  // dol%เลขบัตร 13 หลัก
+  // ===============================
+  if (text.toLowerCase().startsWith('dol%')) {
+    const pid = text.replace(/^dol%/i, '').trim();
+
+    if (!/^\d{13}$/.test(pid)) {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌ กรุณาระบุเลขบัตรประชาชน 13 หลัก\nตัวอย่าง: dol%1234567891234'
+      });
+    }
+
+    return reply(
+  event.replyToken,
+  buildOfficeHourSearchFlex(pid)
+);
+  }
+
+if (text.startsWith('@')) {
+  if (!isAdmin(userId)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ คำสั่งนี้ใช้ได้เฉพาะแอดมิน'
+    });
+  }
+
+  const raw = text.slice(1).trim();
+  const commaIndex = raw.indexOf(',');
+
+  if (commaIndex === -1) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ รูปแบบไม่ถูกต้อง\nตัวอย่าง:\n@UID,ข้อความที่จะส่ง'
+    });
+  }
+
+  const targetUserId = raw.slice(0, commaIndex).trim();
+  const messageText = raw.slice(commaIndex + 1).trim();
+
+  if (!targetUserId || !messageText) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ กรุณาระบุ UID และข้อความ\nตัวอย่าง:\n@Uxxxx,สวัสดีครับ'
+    });
+  }
+
+  try {
+    await push(targetUserId, {
+      type: 'text',
+      text: messageText
+    });
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+`✅ ส่งข้อความถึงสมาชิกแล้ว
+
+🆔 UID:
+${targetUserId}
+
+📝 ข้อความ:
+${messageText}`
+    });
+
+  } catch (e) {
+    console.log('admin send to user error:', e.message);
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ ส่งข้อความไม่สำเร็จ กรุณาตรวจสอบ UID'
+    });
+  }
+}
+
 if (
   text.startsWith('d#') ||
+  text.startsWith('tv#') ||
   text.startsWith('t#') ||
   text.startsWith('tid#') ||
   text.startsWith('tn#') ||
   text.startsWith('f#') ||
+  text.startsWith('all%') ||
   text.startsWith('tic%') ||
   text.startsWith('atm%') ||
   text.startsWith('cell%') ||
   text.startsWith('pid%') ||
   text.startsWith('nm%') ||
   text.startsWith('h%') ||
+  text.startsWith('dbd%') ||
+  text.startsWith('nb%') ||
   text.startsWith('si%') ||
   text.startsWith('dc%') ||
   text.startsWith('dl#') ||
@@ -6239,7 +25725,10 @@ if (
   text.startsWith('cctv%') ||
   text.startsWith('tisi%') ||
   text.startsWith('s%') ||
-  text.startsWith('bq%')
+  text.startsWith('sc%') ||
+  text.startsWith('bq%') ||
+  text.startsWith('kp%') ||
+  text.startsWith('uf%')
 ) {
   try {
     const profile = await getProfile(userId);
@@ -6263,8 +25752,354 @@ if (
   }
 }
 
-  const db = loadDB();
-  const member = db.members?.[userId];
+  // =========================
+  // BASE% REQUEST FLOW
+  // =========================
+  if (text.toLowerCase() === 'base%') {
+
+  // =========================
+  // ตรวจสิทธิ์สมาชิก
+  // =========================
+  if (
+    !isActiveMember(member) &&
+    !isAdmin(userId)
+  ) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+          '❌ คำสั่ง base% ใช้ได้เฉพาะสมาชิกที่ได้รับอนุมัติและยังไม่หมดอายุ'
+      }
+    );
+
+  }
+
+
+  // ล้าง session แบบเก่า
+  // เผื่อผู้ใช้เคยค้างอยู่ในขั้นตอนเดิม
+  delete baseRequestSessions[userId];
+
+
+  // =========================
+  // เปิด LIFF BASE REQUEST
+  // =========================
+  return reply(
+    event.replyToken,
+    {
+      type: 'flex',
+
+      altText:
+        '📡 แบบฟอร์มขอข้อมูลสัญญาณ',
+
+      contents: {
+        type: 'bubble',
+        size: 'mega',
+
+        header: {
+          type: 'box',
+          layout: 'vertical',
+
+          backgroundColor:
+            '#0F172A',
+
+          paddingAll:
+            '18px',
+
+          contents: [
+
+            {
+              type: 'text',
+              text:
+                '📡 BASE REQUEST',
+
+              color:
+                '#FFFFFF',
+
+              weight:
+                'bold',
+
+              size:
+                'xl',
+
+              wrap:
+                true
+            },
+
+            {
+              type: 'text',
+              text:
+                'MEGABOT SIGNAL REQUEST SYSTEM',
+
+              color:
+                '#94A3B8',
+
+              size:
+                'xs',
+
+              margin:
+                'sm',
+
+              wrap:
+                true
+            }
+
+          ]
+        },
+
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+
+          spacing:
+            'md',
+
+          paddingAll:
+            '20px',
+
+          contents: [
+
+            {
+              type: 'text',
+              text:
+                'กรอกข้อมูลเป้าหมาย เหตุในการขอข้อมูล และแนบหลักฐานประกอบคำขอผ่านแบบฟอร์มสมาชิก',
+
+              size:
+                'sm',
+
+              color:
+                '#334155',
+
+              wrap:
+                true
+            },
+
+            {
+              type: 'separator',
+              margin:
+                'md'
+            },
+
+            {
+              type: 'text',
+              text:
+                '📱 หมายเลขโทรศัพท์เป้าหมาย',
+
+              size:
+                'sm',
+
+              color:
+                '#64748B',
+
+              wrap:
+                true
+            },
+
+            {
+              type: 'text',
+              text:
+                '📡 เครือข่าย AIS / TRUE / DTAC',
+
+              size:
+                'sm',
+
+              color:
+                '#64748B',
+
+              wrap:
+                true
+            },
+
+            {
+              type: 'text',
+              text:
+                '📁 ชื่อเคส / เหตุในการขอข้อมูล',
+
+              size:
+                'sm',
+
+              color:
+                '#64748B',
+
+              wrap:
+                true
+            },
+
+            {
+              type: 'text',
+              text:
+                '👤 ข้อมูลเป้าหมาย',
+
+              size:
+                'sm',
+
+              color:
+                '#64748B',
+
+              wrap:
+                true
+            },
+
+            {
+              type: 'text',
+              text:
+                '📎 แนบภาพหลักฐานประกอบคำขอ',
+
+              size:
+                'sm',
+
+              color:
+                '#64748B',
+
+              wrap:
+                true
+            }
+
+          ]
+        },
+
+
+        footer: {
+          type: 'box',
+          layout: 'vertical',
+
+          paddingAll:
+            '16px',
+
+          contents: [
+
+            {
+              type: 'button',
+
+              style:
+                'primary',
+
+              color:
+                '#2563EB',
+
+              height:
+                'sm',
+
+              action: {
+                type: 'uri',
+
+                label:
+                  'เปิดแบบฟอร์มขอสัญญาณ',
+
+                uri:
+                  'https://liff.line.me/2011072783-DoxaHzSG'
+              }
+            }
+
+          ]
+        }
+      }
+    }
+  );
+
+}
+
+  if (text.toLowerCase() === 'ยกเลิกbase' || text.toLowerCase() === 'cancelbase') {
+    delete baseRequestSessions[userId];
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '✅ ยกเลิกรายการ base% แล้ว'
+    });
+  }
+
+  const baseSession = baseRequestSessions[userId];
+
+  if (baseSession) {
+    if (baseSession.step === 'waiting_phone') {
+      const phone = text.replace(/\D/g, '');
+
+      if (!/^0\d{9}$/.test(phone)) {
+        return reply(event.replyToken, {
+          type: 'text',
+          text: '❌ กรุณาแจ้งหมายเลขโทรศัพท์ให้ครบ 10 หลัก เช่น 0812345678'
+        });
+      }
+
+      baseSession.phone = phone;
+      baseSession.step = 'waiting_network';
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text:
+`แจ้งเครือข่าย เช่น AIS TRUE DTAC
+🚨 หากไม่ทราบ ให้ใช้คำสั่ง %66 เพื่อเช็ค`
+      });
+    }
+
+    if (baseSession.step === 'waiting_network') {
+      const network = text.trim().toUpperCase();
+
+      if (!network || network.length > 50) {
+        return reply(event.replyToken, {
+          type: 'text',
+          text: '❌ กรุณาแจ้งชื่อเครือข่าย เช่น AIS TRUE หรือ DTAC'
+        });
+      }
+
+      baseSession.network = network;
+      baseSession.step = 'waiting_case';
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text: 'แจ้งชื่อเคสคดี หรือชื่อเคส เช่น หมายจับ/ลักทรัพย์'
+      });
+    }
+
+    if (baseSession.step === 'waiting_case') {
+      if (text.length < 2 || text.length > 200) {
+        return reply(event.replyToken, {
+          type: 'text',
+          text: '❌ กรุณาแจ้งชื่อเคสหรือรายละเอียดคดีให้ชัดเจน'
+        });
+      }
+
+      baseSession.caseName = text;
+      baseSession.step = 'waiting_target';
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text: 'แจ้งข้อมูลชื่อ นามสกุลเป้าหมาย และเลขบัตรประชาชน 13 หลัก'
+      });
+    }
+
+    if (baseSession.step === 'waiting_target') {
+      const citizenId = (text.match(/\d{13}/) || [])[0];
+
+      if (!citizenId) {
+        return reply(event.replyToken, {
+          type: 'text',
+          text: '❌ กรุณาแจ้งชื่อ-นามสกุลเป้าหมาย พร้อมเลขบัตรประชาชน 13 หลัก'
+        });
+      }
+
+      baseSession.targetInfo = text;
+      baseSession.citizenId = citizenId;
+      baseSession.step = 'waiting_evidence';
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text:
+`รบกวนส่งภาพหมายจับกรณีเคสหมายจับ
+หากไม่ใช่หมายจับ กรุณาส่งภาพหลักฐานเข้ามาครับ
+
+พิมพ์ "ยกเลิกbase" หากต้องการยกเลิกรายการ`
+      });
+    }
+
+    if (baseSession.step === 'waiting_evidence') {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '📸 กรุณาส่งเป็นรูปภาพหลักฐานเข้ามาครับ'
+      });
+    }
+  }
 
 if (text === 'แจ้งสลิปสนับสนุน') {
   supportSlipSessions[userId] = {
@@ -6370,6 +26205,69 @@ if (text.startsWith('สมาชิกใกล้หมดอายุ')) {
   });
 }
 
+if (text.toLowerCase().startsWith('jk%')) {
+  const phone = text.slice(3).trim();
+
+  if (!phone) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ รูปแบบคำสั่ง\njk%0827161650'
+    });
+  }
+
+  const result = await searchJunkCall(phone);
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text: result
+  });
+}
+
+if (text.startsWith('tro%')) {
+
+  const query = text.replace(/^tro%/i, '').trim();
+
+  if (!query) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ กรุณาระบุข้อมูล\nตัวอย่าง: tro%1กก 123 กรุงเทพ'
+    });
+  }
+
+  try {
+    const profile = await getProfile(userId);
+
+    for (const adminId of ADMIN_IDS) {
+      await push(adminId, {
+        type: 'text',
+        text:
+`📢 มีสมาชิกใช้งานคำสั่ง tro%
+
+👤 ชื่อ LINE:
+${profile.displayName || '-'}
+
+🆔 UID:
+${userId}
+
+📝 ข้อมูลที่ค้น:
+${text}
+
+ตอบกลับสมาชิก:
+@${userId},ข้อความที่จะส่ง`
+      });
+    }
+  } catch (e) {
+    console.log('tro% notify admin error:', e.message);
+  }
+
+  return reply(event.replyToken, {
+  type: 'text',
+  text:
+`🔎รอข้อมูลจากระบบอาจใช้เวลาในการค้นหา
+***ไม่ต้องส่งซ้ำครับ***`
+});
+}
+
 if (/^dis%/i.test(text)) {
   const raw = text.replace(/^dis%/i, '').trim();
   const parts = raw.split('/');
@@ -6409,19 +26307,52 @@ if (/^dis%/i.test(text)) {
   text === 'สนับสนุน' ||
   text === '#donate'
 ) {
-  return reply(event.replyToken, {
-    type: 'flex',
-    altText: 'แพ็คเกจสนับสนุนเซิร์ฟเวอร์',
-    contents: {
-      type: 'carousel',
-      contents: [
-  packageBubble('30 วัน', '499 บาท'),
-  packageBubble('90 วัน', '1299 บาท'),
-  packageBubble('180 วัน', '2500 บาท', '🔥 ยอดนิยม'),
-  packageBubble('365 วัน', '4999 บาท', '⭐ คุ้มที่สุด')
-]
+
+  return reply(event.replyToken, [
+
+    // ==========================================
+    // FLEX ชุดที่ 1 : แพ็กเกจเดิม
+    // ==========================================
+    {
+      type: 'flex',
+      altText: 'แพ็คเกจสนับสนุนเซิร์ฟเวอร์',
+
+      contents: {
+        type: 'carousel',
+
+        contents: [
+          packageBubble('30 วัน', '499 บาท'),
+
+          packageBubble(
+            '90 วัน',
+            '1299 บาท'
+          ),
+
+          packageBubble(
+            '180 วัน',
+            '2500 บาท',
+            '🔥 ยอดนิยม'
+          ),
+
+          packageBubble(
+            '365 วัน',
+            '4999 บาท',
+            '⭐ คุ้มที่สุด'
+          )
+        ]
+      }
+    },
+
+    // ==========================================
+    // FLEX ชุดที่ 2 : ชุดใหม่
+    // ==========================================
+    {
+      type: 'flex',
+      altText: 'คำสั่งสนับสนุนเพิ่มเติม',
+      contents: extraSupportFlex()
     }
-  });
+
+  ]);
 }
 
 if (text === 'สนับสนุน4999') {
@@ -6626,42 +26557,325 @@ text:`✅ อนุญาต ${phone} ใช้ si% แล้ว`
   }
 
 if (text === 'pt%') {
-  plateOcrSessions[userId] = true;
 
-  return reply(event.replyToken, {
-    type: 'text',
-    text: `🚘 โหมดอ่านป้ายทะเบียน
+  return reply(
+    event.replyToken,
+    {
+      type: 'flex',
 
-กรุณาส่งรูปรถหรือป้ายทะเบียน`
-  });
+      altText:
+        '🚘 ระบบอ่านป้ายทะเบียนรถ',
+
+      contents: {
+        type: 'bubble',
+        size: 'mega',
+
+        header: {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: '#0F172A',
+          paddingAll: '18px',
+
+          contents: [
+            {
+              type: 'text',
+              text: '🚘 อ่านป้ายทะเบียนรถ',
+              color: '#FFFFFF',
+              weight: 'bold',
+              size: 'xl',
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: 'MEGABOT AI TOOLS',
+              color: '#94A3B8',
+              size: 'xs',
+              margin: 'sm'
+            }
+          ]
+        },
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          spacing: 'md',
+          paddingAll: '20px',
+
+          contents: [
+            {
+              type: 'text',
+              text:
+                'อัปโหลดภาพรถหรือภาพป้ายทะเบียน เพื่อให้ระบบทำการอ่านและวิเคราะห์ข้อมูล',
+              size: 'sm',
+              color: '#334155',
+              wrap: true
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            {
+              type: 'text',
+              text: '📷 รองรับ JPG / PNG / WEBP',
+              size: 'sm',
+              color: '#64748B',
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: '🔐 สำหรับสมาชิกที่มีสิทธิ์ใช้งาน',
+              size: 'sm',
+              color: '#64748B',
+              wrap: true
+            }
+          ]
+        },
+
+        footer: {
+          type: 'box',
+          layout: 'vertical',
+          paddingAll: '16px',
+
+          contents: [
+            {
+              type: 'button',
+              style: 'primary',
+              color: '#2563EB',
+              height: 'sm',
+
+              action: {
+                type: 'uri',
+                label: 'เปิดระบบอ่านป้ายทะเบียน',
+                uri:
+                  'https://liff.line.me/2011072783-WS7wKsFc'
+              }
+            }
+          ]
+        }
+      }
+    }
+  );
+
 }
 
-if (text.startsWith('pid%')) {
-  const query = text.replace(/^pid%/i, '').trim();
+if (text.startsWith('b%')) {
 
-  if (!query) {
+  const query = text.slice(2).trim();
+
+  const parts = query.split('/').map(v => v.trim());
+
+  if (parts.length !== 4) {
     return reply(event.replyToken, {
       type: 'text',
-      text: '❌ กรุณาระบุเลขบัตรประชาชน หรือ ชื่อสกุล\nตัวอย่าง:\npid%1401000124449\npid%ยุพิน บุญโกบุตร'
+      text:
+`❌ รูปแบบคำสั่งไม่ถูกต้อง
+
+ใช้:
+b%MCC/MNC/LAC/CID
+
+ตัวอย่าง:
+b%520/3/6135/18461`
+    });
+  }
+
+  const [mcc, mnc, lac, cid] = parts;
+
+  if (
+    !/^\d+$/.test(mcc) ||
+    !/^\d+$/.test(mnc) ||
+    !/^\d+$/.test(lac) ||
+    !/^\d+$/.test(cid)
+  ) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ MCC/MNC/LAC/CID ต้องเป็นตัวเลขเท่านั้น'
+    });
+  }
+
+  if (!UNWIREDLABS_TOKEN) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ ยังไม่ได้ตั้งค่า UNWIREDLABS_TOKEN'
     });
   }
 
   try {
-    const result = await searchPID(query);
+
+    const result = await autoLookupUnwiredCell(
+      mcc,
+      mnc,
+      lac,
+      cid
+    );
+
+    if (!result.radio || result.data?.status !== 'ok') {
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text:
+`❌ ไม่พบตำแหน่ง Cell Site
+
+MCC: ${mcc}
+MNC: ${mnc}
+LAC/TAC: ${lac}
+CID: ${cid}
+
+${result.data?.message || 'No matches found'}`
+      });
+    }
+
+    const data = result.data;
+
+    const lat = data.lat;
+    const lon = data.lon;
+
+    const mapsUrl =
+      `https://www.google.com/maps?q=${lat},${lon}`;
 
     return reply(event.replyToken, {
-      type: 'text',
-      text: result
+      type: 'flex',
+      altText: `Cell Site ${mcc}/${mnc}/${lac}/${cid}`,
+
+      contents: {
+        type: 'bubble',
+        size: 'mega',
+
+        header: {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: '#0F172A',
+          paddingAll: '18px',
+
+          contents: [
+            {
+              type: 'text',
+              text: '📡 CELL SITE',
+              color: '#FFFFFF',
+              weight: 'bold',
+              size: 'xl'
+            },
+
+            {
+              type: 'text',
+              text: result.radio,
+              color: '#38BDF8',
+              size: 'sm',
+              margin: 'sm'
+            }
+          ]
+        },
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          spacing: 'md',
+
+          contents: [
+            {
+              type: 'text',
+              text: `MCC: ${mcc}`,
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: `MNC: ${mnc}`,
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: `LAC/TAC: ${lac}`,
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: `CID/eCID: ${cid}`,
+              wrap: true
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            {
+              type: 'text',
+              text: `Lati,Longti: ${lat}, ${lon}`,
+              weight: 'bold',
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: `Accuracy: ${data.accuracy ?? '-'} เมตร`,
+              wrap: true
+            },
+
+            {
+              type: 'text',
+              text: `Location:${data.address || '-'}`,
+              wrap: true
+            }
+          ]
+        },
+
+        footer: {
+          type: 'box',
+          layout: 'vertical',
+          spacing: 'sm',
+
+          contents: [
+            {
+              type: 'button',
+              style: 'primary',
+              action: {
+                type: 'uri',
+                label: '📍 เปิด Google Maps',
+                uri: mapsUrl
+              }
+            },
+
+            {
+              type: 'button',
+              style: 'secondary',
+              action: {
+                type: 'clipboard',
+                label: '📋 คัดลอกพิกัด',
+                clipboardText: `${lat},${lon}`
+              }
+            }
+          ]
+        }
+      }
     });
 
   } catch (err) {
-    console.error('pid lookup error:', err?.response?.data || err.message);
+
+    console.log(
+      'b% error:',
+      err.response?.data || err.message
+    );
 
     return reply(event.replyToken, {
       type: 'text',
-      text: '❌ ไม่พบข้อมูล'
+      text: '❌ เกิดข้อผิดพลาดในการค้นหา Cell Site'
     });
   }
+}
+
+if (text.startsWith('pid%')) {
+  return reply(event.replyToken, {
+    type: 'text',
+    text:
+`💡คำสั่ง pid% อยู่ระหว่างแก้ไข💡
+🙏ขออภัยอย่างสูงครับ🙏`
+  });
 }
 
   if (text.startsWith('lw%')) {
@@ -6897,13 +27111,1331 @@ if (text.startsWith('ดูสมาชิกรอตรวจสอบ')) {
     });
   }
 
-  if (
-  text.startsWith('fx#') ||
-  text.startsWith('a#')
-) {
+if (/^อนุญาติais#/.test(text)) {
+
+  if (!isAdmin(userId)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ คำสั่งนี้ใช้ได้เฉพาะแอดมิน'
+    });
+  }
+
+  const phone = text.replace(/^อนุญาติais#/, '').trim();
+
+  if (!phone) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ กรุณาระบุเบอร์สมาชิก\nตัวอย่าง: อนุญาติais#0812345678'
+    });
+  }
+
+  db.aisPermissions = db.aisPermissions || {};
+  db.aisPermissions[phone] = true;
+
+  saveDB(db);
+
   return reply(event.replyToken, {
     type: 'text',
-    text: '🔍คำสั่งปรับปรุงค้นหาใหม่ภายหลัง...\n⏳command updates⏳'
+    text: `✅ อนุญาตเบอร์ ${phone} ใช้ a# แล้ว`
+  });
+}
+
+ if (text.startsWith('a#')) {
+
+  const phone = member?.phone || '';
+
+  const allowAis =
+    db.aisPermissions &&
+    db.aisPermissions[phone];
+
+  if (!allowAis) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: 'สำหรับสมาชิกที่มีสิทธิ์ใช้งาน🚨'
+    });
+  }
+
+  // ดึงเฉพาะข้อมูลหลัง a#
+  const searchNumber = text.slice(2).trim();
+
+  // ต้องเป็นเลข 10 หลัก หรือ 13 หลักเท่านั้น
+  if (!/^(\d{10}|\d{13})$/.test(searchNumber)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+`❌ รูปแบบคำสั่งไม่ถูกต้อง
+
+ใช้ได้เฉพาะ:
+a#ตามด้วยเลข 10 หลัก
+หรือ
+a#ตามด้วยเลข 13 หลัก
+
+ตัวอย่าง:
+a#0812345678
+a#1234567890123`
+    });
+  }
+
+  try {
+    const profile = await getProfile(userId);
+
+    for (const adminId of ADMIN_IDS) {
+      await push(adminId, {
+        type: 'flex',
+        altText: 'แจ้งเตือนการใช้งานคำสั่ง a#',
+
+        contents: {
+          type: 'bubble',
+          size: 'mega',
+
+          header: {
+            type: 'box',
+            layout: 'vertical',
+            backgroundColor: '#0F172A',
+            paddingAll: '18px',
+
+            contents: [
+              {
+                type: 'text',
+                text: '📢 การใช้งานคำสั่ง a#',
+                color: '#FFFFFF',
+                weight: 'bold',
+                size: 'lg'
+              },
+              {
+                type: 'text',
+                text: 'สมาชิกที่ได้รับอนุญาต',
+                color: '#CBD5E1',
+                size: 'sm',
+                margin: 'sm'
+              }
+            ]
+          },
+
+          body: {
+            type: 'box',
+            layout: 'vertical',
+            spacing: 'md',
+            paddingAll: '18px',
+
+            contents: [
+              {
+                type: 'text',
+                text: '👤 ชื่อ LINE',
+                size: 'sm',
+                color: '#64748B'
+              },
+              {
+                type: 'text',
+                text: profile.displayName || '-',
+                weight: 'bold',
+                size: 'md',
+                wrap: true
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '🆔 UID',
+                size: 'sm',
+                color: '#64748B',
+                margin: 'md'
+              },
+              {
+                type: 'text',
+                text: userId,
+                size: 'sm',
+                weight: 'bold',
+                wrap: true
+              },
+
+              {
+                type: 'button',
+                margin: 'sm',
+                style: 'secondary',
+                height: 'sm',
+                action: {
+                  type: 'clipboard',
+                  label: '📋 คัดลอก UID',
+                  clipboardText: userId
+                }
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '📱 เบอร์สมาชิก',
+                size: 'sm',
+                color: '#64748B',
+                margin: 'md'
+              },
+              {
+                type: 'text',
+                text: phone || '-',
+                weight: 'bold',
+                size: 'md'
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '📝 ข้อมูลที่ค้น',
+                size: 'sm',
+                color: '#64748B',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: text,
+                weight: 'bold',
+                size: 'md',
+                wrap: true
+              },
+
+              {
+                type: 'button',
+                margin: 'sm',
+                style: 'primary',
+                height: 'sm',
+                action: {
+                  type: 'clipboard',
+                  label: '📋 คัดลอกข้อมูลที่ค้น',
+                  clipboardText: text
+                }
+              }
+            ]
+          }
+        }
+      });
+    }
+
+  } catch (e) {
+    console.log('a# notify admin error:', e.message);
+  }
+
+  return;
+}
+
+if (/^อนุญาตfx#/.test(text)) {
+
+  if (!isAdmin(userId)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ คำสั่งนี้ใช้ได้เฉพาะแอดมิน'
+    });
+  }
+
+  const phone = text.replace(/^อนุญาตfx#/, '').trim();
+
+  if (!phone) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ กรุณาระบุเบอร์สมาชิก\nตัวอย่าง: อนุญาตfx#0812345678'
+    });
+  }
+
+  db.fxPermissions = db.fxPermissions || {};
+  db.fxPermissions[phone] = true;
+
+  saveDB(db);
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text: `✅ อนุญาตเบอร์ ${phone} ใช้ fx# แล้ว`
+  });
+}
+
+if (text.startsWith('fx#')) {
+
+  const phone = member?.phone || '';
+
+  const allowFx =
+    db.fxPermissions &&
+    db.fxPermissions[phone];
+
+  if (!allowFx) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: 'สำหรับสมาชิกที่มีสิทธิ์ใช้งาน🚨'
+    });
+  }
+
+  try {
+    const profile = await getProfile(userId);
+
+    for (const adminId of ADMIN_IDS) {
+      await push(adminId, {
+        type: 'flex',
+        altText: 'แจ้งเตือนการใช้งานคำสั่ง fx#',
+        contents: {
+          type: 'bubble',
+          size: 'mega',
+
+          header: {
+            type: 'box',
+            layout: 'vertical',
+            backgroundColor: '#0F172A',
+            paddingAll: '18px',
+            contents: [
+              {
+                type: 'text',
+                text: '📢 การใช้งานคำสั่ง fx#',
+                color: '#FFFFFF',
+                weight: 'bold',
+                size: 'lg'
+              },
+              {
+                type: 'text',
+                text: 'สมาชิกที่ได้รับอนุญาต',
+                color: '#CBD5E1',
+                size: 'sm',
+                margin: 'sm'
+              }
+            ]
+          },
+
+          body: {
+            type: 'box',
+            layout: 'vertical',
+            spacing: 'md',
+            paddingAll: '18px',
+            contents: [
+              {
+                type: 'text',
+                text: '👤 ชื่อ LINE',
+                size: 'sm',
+                color: '#64748B'
+              },
+              {
+                type: 'text',
+                text: profile.displayName || '-',
+                weight: 'bold',
+                size: 'md',
+                wrap: true
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '🆔 UID',
+                size: 'sm',
+                color: '#64748B',
+                margin: 'md'
+              },
+              {
+                type: 'text',
+                text: userId,
+                size: 'sm',
+                weight: 'bold',
+                wrap: true
+              },
+              {
+                type: 'button',
+                margin: 'sm',
+                style: 'secondary',
+                height: 'sm',
+                action: {
+  type: 'clipboard',
+  label: '📋 คัดลอก UID',
+  clipboardText: userId
+}
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '📱 เบอร์สมาชิก',
+                size: 'sm',
+                color: '#64748B',
+                margin: 'md'
+              },
+              {
+                type: 'text',
+                text: phone || '-',
+                weight: 'bold',
+                size: 'md'
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '📝 ข้อมูลที่ค้น',
+                size: 'sm',
+                color: '#64748B',
+                margin: 'md'
+              },
+              {
+                type: 'text',
+                text: text,
+                weight: 'bold',
+                size: 'md',
+                wrap: true
+              },
+              {
+                type: 'button',
+                margin: 'sm',
+                style: 'primary',
+                height: 'sm',
+                action: {
+  type: 'clipboard',
+  label: '📋 คัดลอกข้อมูลที่ค้น',
+  clipboardText: text
+}
+              }
+            ]
+          }
+        }
+      });
+    }
+
+  } catch (e) {
+    console.log('fx# notify admin error:', e.message);
+  }
+
+  return;
+}
+
+// =====================================
+// อนุญาตระบบขอข้อมูลสัญญาณ
+// รูปแบบ:
+// อนุญาตสัญญาณ#0812345678
+// =====================================
+if (text.startsWith('อนุญาตสัญญาณ#')) {
+
+  // ==============================
+  // เฉพาะ ADMIN
+  // ==============================
+  if (!ADMIN_IDS.includes(userId)) {
+
+    await push(userId, {
+      type: 'text',
+      text: '❌ คำสั่งนี้ใช้ได้เฉพาะแอดมิน'
+    });
+
+    return;
+  }
+
+
+  // ==============================
+  // ดึงเบอร์สมาชิก
+  // ==============================
+  const phone =
+    text
+      .slice('อนุญาตสัญญาณ#'.length)
+      .trim()
+      .replace(/\D/g, '');
+
+
+  if (!/^0\d{9}$/.test(phone)) {
+
+    await push(userId, {
+      type: 'text',
+      text:
+`❌ รูปแบบไม่ถูกต้อง
+
+กรุณาใช้:
+อนุญาตสัญญาณ#เบอร์สมาชิก
+
+ตัวอย่าง:
+อนุญาตสัญญาณ#0812345678`
+    });
+
+    return;
+  }
+
+
+  // ==============================
+  // ค้นหาสมาชิกจากเบอร์
+  // ==============================
+  const foundMember =
+    Object.entries(
+      db.members || {}
+    ).find(([targetUid, member]) => {
+
+      const memberPhone =
+        String(member?.phone || '')
+          .replace(/\D/g, '');
+
+      return memberPhone === phone;
+    });
+
+
+  if (!foundMember) {
+
+    await push(userId, {
+      type: 'text',
+      text:
+        `❌ ไม่พบสมาชิกหมายเลข ${phone}`
+    });
+
+    return;
+  }
+
+
+  const [
+    targetUserId,
+    targetMember
+  ] = foundMember;
+
+
+  // ==============================
+  // สร้าง Permission Map
+  // ==============================
+  db.remoteSignalPermissions =
+    db.remoteSignalPermissions || {};
+
+
+  // ==============================
+  // เปิดสิทธิ์
+  // ==============================
+  db.remoteSignalPermissions[
+    targetUserId
+  ] = true;
+
+
+  saveDB(db);
+
+
+  // ==============================
+  // แจ้ง ADMIN
+  // ==============================
+  await push(userId, {
+
+    type: 'text',
+
+    text:
+`✅ อนุญาตใช้งานระบบสัญญาณแล้ว
+
+👤 สมาชิก : ${
+  targetMember.lineName ||
+  targetMember.displayName ||
+  targetMember.fullname ||
+  '-'
+}
+📱 เบอร์สมาชิก : ${phone}
+🆔 UID : ${targetUserId}
+
+📡 สิทธิ์ขอข้อมูล : มีสิทธิ์ใช้งาน`
+
+  });
+
+
+  // ==============================
+  // แจ้ง MEMBER
+  // ==============================
+  try {
+
+    await push(targetUserId, {
+
+      type: 'text',
+
+      text:
+`✅ ได้รับอนุญาตใช้งานแล้ว
+
+📡 ระบบขอข้อมูลสัญญาณระยะไกล
+
+สิทธิ์ขอข้อมูล :
+✅ มีสิทธิ์ใช้งาน
+
+สามารถเข้าใช้งานระบบได้แล้ว`
+
+    });
+
+  } catch (err) {
+
+    console.error(
+      'SIGNAL PERMISSION MEMBER NOTIFY ERROR:',
+      err.response?.data ||
+      err.message ||
+      err
+    );
+
+  }
+
+
+  return;
+}
+
+// =====================================
+// ยกเลิกสิทธิ์ระบบขอข้อมูลสัญญาณ
+// รูปแบบ:
+// ยกเลิกสัญญาณ#0812345678
+// =====================================
+if (text.startsWith('ยกเลิกสัญญาณ#')) {
+
+  // ==============================
+  // เฉพาะ ADMIN
+  // ==============================
+  if (!ADMIN_IDS.includes(userId)) {
+
+    await push(userId, {
+      type: 'text',
+      text: '❌ คำสั่งนี้ใช้ได้เฉพาะแอดมิน'
+    });
+
+    return;
+  }
+
+
+  // ==============================
+  // ดึงเบอร์สมาชิก
+  // ==============================
+  const phone =
+    text
+      .slice('ยกเลิกสัญญาณ#'.length)
+      .trim()
+      .replace(/\D/g, '');
+
+
+  if (!/^0\d{9}$/.test(phone)) {
+
+    await push(userId, {
+      type: 'text',
+      text:
+`❌ รูปแบบไม่ถูกต้อง
+
+กรุณาใช้:
+ยกเลิกสัญญาณ#เบอร์สมาชิก
+
+ตัวอย่าง:
+ยกเลิกสัญญาณ#0812345678`
+    });
+
+    return;
+  }
+
+
+  // ==============================
+  // ค้นหาสมาชิก
+  // ==============================
+  const foundMember =
+    Object.entries(
+      db.members || {}
+    ).find(([targetUid, member]) => {
+
+      const memberPhone =
+        String(member?.phone || '')
+          .replace(/\D/g, '');
+
+      return memberPhone === phone;
+    });
+
+
+  if (!foundMember) {
+
+    await push(userId, {
+      type: 'text',
+      text:
+        `❌ ไม่พบสมาชิกหมายเลข ${phone}`
+    });
+
+    return;
+  }
+
+
+  const [
+    targetUserId,
+    targetMember
+  ] = foundMember;
+
+
+  db.remoteSignalPermissions =
+    db.remoteSignalPermissions || {};
+
+
+  // ==============================
+  // ปิดสิทธิ์
+  // ==============================
+  delete db.remoteSignalPermissions[
+    targetUserId
+  ];
+
+
+  saveDB(db);
+
+
+  // ==============================
+  // แจ้ง ADMIN
+  // ==============================
+  await push(userId, {
+
+    type: 'text',
+
+    text:
+`🔒 ยกเลิกสิทธิ์ระบบสัญญาณแล้ว
+
+👤 สมาชิก : ${
+  targetMember.lineName ||
+  targetMember.displayName ||
+  targetMember.fullname ||
+  '-'
+}
+📱 เบอร์สมาชิก : ${phone}
+🆔 UID : ${targetUserId}
+
+📡 สิทธิ์ขอข้อมูล : ไม่มีสิทธิ์ใช้งาน`
+
+  });
+
+
+  // ==============================
+  // แจ้ง MEMBER
+  // ==============================
+  try {
+
+    await push(targetUserId, {
+
+      type: 'text',
+
+      text:
+`🔒 สิทธิ์ใช้งานถูกยกเลิก
+
+📡 ระบบขอข้อมูลสัญญาณระยะไกล
+
+สิทธิ์ขอข้อมูล :
+🔒 ไม่มีสิทธิ์ใช้งาน
+
+หากมีข้อสงสัย กรุณาติดต่อผู้ดูแลระบบ`
+
+    });
+
+  } catch (err) {
+
+    console.error(
+      'SIGNAL REVOKE MEMBER NOTIFY ERROR:',
+      err.response?.data ||
+      err.message ||
+      err
+    );
+
+  }
+
+
+  return;
+}
+
+// =====================================
+// ADMIN : เพิ่มวันสมาชิกแบบกำหนดเอง
+//
+// ตัวอย่าง:
+// เพิ่มวัน#0827161650#1
+// เพิ่มวัน#0827161650#10
+// เพิ่มวัน#0827161650#45
+// =====================================
+if (
+  text.startsWith('เพิ่มวัน#')
+) {
+
+  // เฉพาะ Admin
+  if (!ADMIN_IDS.includes(userId)) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+          '❌ คำสั่งนี้สำหรับแอดมินเท่านั้น'
+      }
+    );
+  }
+
+
+  const parts =
+    text
+      .split('#')
+      .map(v => v.trim());
+
+
+  if (parts.length !== 3) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`❌ รูปแบบคำสั่งไม่ถูกต้อง
+
+ตัวอย่าง
+เพิ่มวัน#0827161650#1
+เพิ่มวัน#0827161650#10
+เพิ่มวัน#0827161650#45`
+      }
+    );
+  }
+
+
+  const phone =
+    String(parts[1] || '')
+      .replace(/\D/g, '');
+
+
+  const days =
+    Number(parts[2]);
+
+
+  // ตรวจสอบเบอร์
+  if (!/^0\d{9}$/.test(phone)) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+          '❌ กรุณาระบุเบอร์สมาชิก 10 หลัก'
+      }
+    );
+  }
+
+
+  // ตรวจจำนวนวัน
+  if (
+    !Number.isInteger(days) ||
+    days <= 0
+  ) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+          '❌ จำนวนวันต้องเป็นเลขจำนวนเต็มมากกว่า 0'
+      }
+    );
+  }
+
+
+  // ป้องกันพิมพ์ผิดจนเพิ่มมากเกินไป
+  if (days > 3650) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+          '❌ เพิ่มได้สูงสุดครั้งละ 3650 วัน'
+      }
+    );
+  }
+
+
+  const db =
+    loadDB();
+
+  db.members =
+    db.members || {};
+
+
+  // =====================================
+  // หา Member จากเบอร์โทร
+  // =====================================
+  const memberEntry =
+    Object.entries(
+      db.members
+    )
+      .find(([uid, m]) => {
+
+        const memberPhone =
+          String(
+            m?.phone ||
+            m?.tel ||
+            m?.mobile ||
+            ''
+          )
+            .replace(/\D/g, '');
+
+        return (
+          memberPhone === phone
+        );
+      });
+
+
+  if (!memberEntry) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`❌ ไม่พบสมาชิก
+
+📱 เบอร์ : ${phone}`
+      }
+    );
+  }
+
+
+  const [
+    targetUserId,
+    targetMember
+  ] = memberEntry;
+
+
+  // =====================================
+  // คำนวณวันหมดอายุ
+  // =====================================
+
+  const now =
+    new Date();
+
+
+  const oldExpire =
+    targetMember.expireAt
+      ? new Date(
+          targetMember.expireAt
+        )
+      : null;
+
+
+  let startDate;
+
+
+  // ถ้ามีวันหมดอายุเดิม
+  // และยังไม่หมดอายุ
+  // ให้บวกต่อจากวันเดิม
+  if (
+    oldExpire &&
+    !Number.isNaN(
+      oldExpire.getTime()
+    ) &&
+    oldExpire.getTime() >
+      now.getTime()
+  ) {
+
+    startDate =
+      new Date(oldExpire);
+
+  } else {
+
+    // ถ้าหมดแล้ว / ไม่มีวันหมดอายุ
+    // เริ่มจากวันนี้
+    startDate =
+      new Date(now);
+  }
+
+
+  const newExpire =
+    new Date(startDate);
+
+
+  newExpire.setDate(
+    newExpire.getDate() +
+    days
+  );
+
+
+  // =====================================
+  // อัปเดต Member
+  // =====================================
+
+  targetMember.status =
+    'approved';
+
+  targetMember.expireAt =
+    newExpire.toISOString();
+
+  targetMember.updatedAt =
+    new Date().toISOString();
+
+  targetMember.lastAddedDays =
+    days;
+
+
+  db.members[targetUserId] =
+    targetMember;
+
+
+  saveDB(db);
+
+
+  // =====================================
+  // แสดงผล
+  // =====================================
+
+  const fullName =
+    targetMember.fullname ||
+    targetMember.fullName ||
+    '-';
+
+
+  const expireText =
+    newExpire.toLocaleString(
+      'th-TH',
+      {
+        timeZone:
+          'Asia/Bangkok',
+
+        year:
+          'numeric',
+
+        month:
+          '2-digit',
+
+        day:
+          '2-digit',
+
+        hour:
+          '2-digit',
+
+        minute:
+          '2-digit'
+      }
+    );
+
+
+  return reply(
+    event.replyToken,
+    {
+      type: 'text',
+
+      text:
+`✅ เพิ่มวันสมาชิกเรียบร้อย
+
+👤 สมาชิก : ${fullName}
+📱 เบอร์ : ${phone}
+➕ เพิ่ม : ${days} วัน
+📅 หมดอายุ : ${expireText}
+
+UID :
+${targetUserId}`
+    }
+  );
+}
+
+if (text.startsWith('อนุญาตสปสช#')) {
+
+  // เฉพาะแอดมินเท่านั้น
+  if (!ADMIN_IDS.includes(userId)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ คำสั่งนี้สำหรับแอดมินเท่านั้น'
+    });
+  }
+
+  // ดึงเบอร์หลัง #
+  const phone = text
+    .slice('อนุญาตสปสช#'.length)
+    .trim()
+    .replace(/\D/g, '');
+
+  if (!/^0\d{9}$/.test(phone)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+        '❌ รูปแบบเบอร์ไม่ถูกต้อง\n\n' +
+        'ตัวอย่าง:\n' +
+        'อนุญาตสปสช#0827161650'
+    });
+  }
+
+  // ตรวจว่ามีสมาชิกเบอร์นี้หรือไม่
+  const targetMember = Object.values(db.members || {})
+    .find(m => String(m.phone || '').replace(/\D/g, '') === phone);
+
+  if (!targetMember) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+        `❌ ไม่พบสมาชิก\n` +
+        `📱 เบอร์: ${phone}`
+    });
+  }
+
+  // สร้าง object ถ้ายังไม่มี
+  if (!db.hPermissions) {
+    db.hPermissions = {};
+  }
+
+  // ให้สิทธิ์
+  db.hPermissions[phone] = true;
+
+  saveDB(db);
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text:
+      `✅ อนุญาตใช้งาน สปสช. เรียบร้อย\n\n` +
+      `👤 สมาชิก: ${targetMember.fullname || '-'}\n` +
+      `📱 เบอร์: ${phone}\n\n` +
+      `🔑 สามารถใช้คำสั่ง\n` +
+      `h#ตามด้วยเลข 13 หลัก`
+  });
+}
+
+if (text.startsWith('h#')) {
+
+  // ดึงเลขหลัง h#
+  const number13 = text.slice(2).trim();
+
+  // ต้องเป็นตัวเลข 13 หลักเท่านั้น
+  if (!/^\d{13}$/.test(number13)) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ รูปแบบคำสั่งไม่ถูกต้อง\n\nตัวอย่าง:\nh#1234567890123'
+    });
+  }
+
+  const phone = member?.phone || '';
+
+  const allowH =
+  db.hPermissions &&
+  db.hPermissions[phone];
+
+  if (!allowH) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: 'สำหรับสมาชิกที่มีสิทธิ์ใช้งาน🚨'
+    });
+  }
+
+  try {
+  const profile = await getProfile(userId);
+
+  for (const adminId of ADMIN_IDS) {
+    await push(adminId, {
+      type: 'flex',
+      altText: 'แจ้งเตือนการใช้งานคำสั่ง h#',
+
+      contents: {
+        type: 'bubble',
+        size: 'mega',
+
+        header: {
+          type: 'box',
+          layout: 'vertical',
+          backgroundColor: '#0F172A',
+          paddingAll: '18px',
+          contents: [
+            {
+              type: 'text',
+              text: '📢 การใช้งานคำสั่ง h#',
+              color: '#FFFFFF',
+              weight: 'bold',
+              size: 'lg'
+            },
+            {
+              type: 'text',
+              text: 'สมาชิกที่ได้รับอนุญาต',
+              color: '#CBD5E1',
+              size: 'sm',
+              margin: 'sm'
+            }
+          ]
+        },
+
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          spacing: 'md',
+          paddingAll: '18px',
+
+          contents: [
+
+            // ชื่อ LINE
+            {
+              type: 'text',
+              text: '👤 ชื่อ LINE',
+              size: 'sm',
+              color: '#64748B'
+            },
+            {
+              type: 'text',
+              text: profile.displayName || '-',
+              weight: 'bold',
+              size: 'md',
+              wrap: true
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // UID
+            {
+              type: 'text',
+              text: '🆔 UID',
+              size: 'sm',
+              color: '#64748B',
+              margin: 'md'
+            },
+            {
+              type: 'text',
+              text: userId,
+              size: 'sm',
+              weight: 'bold',
+              wrap: true
+            },
+            {
+              type: 'button',
+              margin: 'sm',
+              style: 'secondary',
+              height: 'sm',
+              action: {
+                type: 'clipboard',
+                label: '📋 คัดลอก UID',
+                clipboardText: userId
+              }
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // เบอร์สมาชิก
+            {
+              type: 'text',
+              text: '📱 เบอร์สมาชิก',
+              size: 'sm',
+              color: '#64748B',
+              margin: 'md'
+            },
+            {
+              type: 'text',
+              text: phone || '-',
+              weight: 'bold',
+              size: 'md'
+            },
+
+            {
+              type: 'separator',
+              margin: 'md'
+            },
+
+            // เลขที่ค้น
+            {
+              type: 'text',
+              text: '🔎 เลขที่ค้น',
+              size: 'sm',
+              color: '#64748B',
+              margin: 'md'
+            },
+            {
+              type: 'text',
+              text: number13,
+              weight: 'bold',
+              size: 'md',
+              wrap: true
+            },
+            {
+              type: 'button',
+              margin: 'sm',
+              style: 'primary',
+              height: 'sm',
+              action: {
+                type: 'clipboard',
+                label: '📋 คัดลอกเลขที่ค้น',
+                clipboardText: number13
+              }
+            }
+          ]
+        }
+      }
+    });
+  }
+
+} catch (e) {
+    console.log('h# notify admin error:', e.message);
+  }
+
+  return;
+}
+
+
+if (text.startsWith('geo%')) {
+  console.log('GEO COMMAND:', text);
+
+  const raw = text.replace('geo%', '').trim();
+  const [mcc, mnc, lac, cid] = raw.split(',').map(x => x.trim());
+
+  if (!mcc || !mnc || !lac || !cid) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ รูปแบบไม่ถูกต้อง\nตัวอย่าง:\ngeo%520,4,5609,1631'
+    });
+  }
+
+  try {
+    const data = await googleCellGeo(mcc, mnc, lac, cid);
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text:
+`📍 GOOGLE GEOLOCATION
+
+MCC : ${mcc}
+MNC : ${mnc}
+LAC : ${lac}
+CID : ${cid}
+
+Latitude : ${data.location.lat}
+Longitude : ${data.location.lng}
+Accuracy : ${data.accuracy} เมตร
+
+🌍 Google Maps
+https://maps.google.com/?q=${data.location.lat},${data.location.lng}`
+    });
+
+  } catch (err) {
+    console.log('GOOGLE GEO ERROR:', err.response?.data || err.message);
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ ไม่สามารถค้นหาพิกัดได้\nกรุณาตรวจสอบ API KEY หรือข้อมูล MCC/MNC/LAC/CID'
+    });
+  }
+}
+
+// =============================
+// 🌐 เมนูสาธารณะ ดูได้ทุกคน
+// =============================
+if (text === 'menu%') {
+
+  return client.replyMessage({
+
+    replyToken: event.replyToken,
+
+    messages: [
+
+      // รายการคำค้นเดิม
+      {
+        type: 'text',
+        text: buildMenuText()
+      },
+
+      // ระบบสวัสดิการแห่งรัฐ
+      buildWelfareMenuFlex(),
+
+      // ระบบวิเคราะห์เส้นเงิน
+      buildMoneyFlowMenuFlex()
+
+    ]
+
   });
 }
 
@@ -6938,32 +28470,116 @@ if (text.startsWith('ดูสมาชิกรอตรวจสอบ')) {
     });
   }
 
-  if (text.startsWith('t#')) {
-    const phone = text.replace(/^t#/i, '').trim();
-    if (!/^0\d{9}$/.test(phone)) {
+  if (text.startsWith('tv#')) {
+    const ti = text.replace(/^tv#/i, '').trim();
+    if (!/^\d{1,9}$/.test(ti)) {
       return reply(event.replyToken, {
         type: 'text',
-        text: '❌ กรุณาระบุเบอร์โทรศัพท์ 10 หลัก เช่น t#0812345678'
+        text: '❌ กรุณาระบุเลข Customer No. 1-9 หลัก เช่น tv#210240911'
       });
     }
 
     try {
-      const data = await fetchTVGCCApi(phone);
+      const data = await fetchTVGCCCustomerInfo(ti);
       return reply(event.replyToken, {
         type: 'text',
-        text: formatTVGCCResult(data, phone)
+        text: formatFiberTvResult(data, ti)
       });
     } catch (err) {
-      console.error('tvgcc phone error:', err?.response?.data || err.message);
+      console.error('tvgcc customer info error:', err?.response?.data || err.message);
       const isTimeout = err.code === 'ECONNABORTED' || /timeout|exceeded/i.test(String(err.message || ''));
       return reply(event.replyToken, {
         type: 'text',
         text: isTimeout
-? '⚠️ ระบบ TRUE ตอบช้า กรุณาลองใหม่ภายหลัง'
-: `❌[${phone}]\nไม่พบข้อมูลเบอร์รายเดืือน`
+          ? '⚠️ ระบบ TRUE ตอบช้า กรุณาลองใหม่ภายหลัง'
+          : `❌ ไม่พบข้อมูลลูกค้า Fiber TV สำหรับ ${ti}`
       });
     }
   }
+
+if (text.startsWith('t#')) {
+    const isTBlocked =
+  db.tBlocked?.[userId] === true;
+
+if (isTBlocked) {
+  return reply(event.replyToken, {
+    type: 'text',
+    text:
+`ท่านสืบค้นผิดกฏระเบียบ❗
+[ระบบทำการแบนคำสั่งสืบค้นดังกล่าว]`
+  });
+}
+  const keyword = text.replace(/^t#/i, '').trim();
+
+  const isPhone =
+  /^0\d{9}$/.test(keyword);
+
+const isCitizenId =
+  /^\d{13}$/.test(keyword);
+
+// Passport เช่น C9658356
+const isPassport =
+  /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]{6,12}$/.test(keyword);
+
+const isFullName =
+  /^[ก-๙A-Za-z.'-]+\s+[ก-๙A-Za-z.' -]+$/.test(keyword);
+
+
+if (
+  !isPhone &&
+  !isCitizenId &&
+  !isPassport &&
+  !isFullName
+) {
+  return reply(event.replyToken, {
+  type: 'text',
+  text:
+    '❌ กรุณาระบุข้อมูลให้ถูกต้อง\n\n' +
+
+    '📱 ค้นหาด้วยเบอร์โทรศัพท์\n' +
+    'ตัวอย่าง  t#0812345678\n\n' +
+
+    '🪪 ค้นหาด้วยเลขบัตรประชาชน\n' +
+    'ตัวอย่าง  t#1234567890123\n\n' +
+
+    '🛂 ค้นหาด้วยเลขพาสปอร์ต\n' +
+    'ตัวอย่าง  t#C123456\n\n' +
+
+    '👤 ค้นหาด้วยชื่อ - นามสกุล\n' +
+    'ตัวอย่าง  t#ชื่อ นามสกุล'
+});
+}
+
+  try {
+    const data = await fetchTrueSearchApi(keyword);
+
+    return reply(event.replyToken, {
+  type: 'text',
+  text: formatTrueSearchResult(
+    data,
+    keyword,
+    member
+  )
+});
+
+  } catch (err) {
+    console.error(
+      'TRUE search error:',
+      err?.response?.data || err.message
+    );
+
+    const isTimeout =
+      err.code === 'ECONNABORTED' ||
+      /timeout|exceeded/i.test(String(err.message || ''));
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text: isTimeout
+        ? '⚠️ ระบบ TRUE ตอบช้า กรุณาลองใหม่ภายหลัง'
+        : `❌[${keyword}]\nไม่พบข้อมูล`
+    });
+  }
+}
 
   if (text.startsWith('tn#')) {
     const name = text.replace(/^tn#/i, '').trim();
@@ -7092,10 +28708,6 @@ if (text.startsWith('nm%')) {
     type: 'text',
     text: result
   });
-}
-
-  if (text === 'menu%') {
-  return reply(event.replyToken, buildMenuCarouselFlex());
 }
 
 if (text.startsWith('picf%')) {
@@ -7248,57 +28860,181 @@ if (text === 'face%') {
   }
 
   if (text.startsWith('%')) {
-    const msisdn = text.substring(1).trim();
-    if (!msisdn) {
-      return reply(event.replyToken, {
-        type: 'text',
-        text: '❌ กรุณาระบุหมายเลขโทรศัพท์ เช่น %+66987654321'
-      });
-    }
-    try {
-      const response = await fetchHlrLookup(msisdn);
 
-      if (response.status === 200) {
-        const data = response.data;
+  const rawMsisdn =
+    text
+      .substring(1)
+      .trim()
+      .replace(/\s+/g, '');
 
-        let resultMsg = `MSISDN: ${data.msisdn || msisdn}\n`;
-        resultMsg += `Subscriber Status: ${(data.connectivity_status || 'N/A').toString().toUpperCase()}\n`;
-        resultMsg += `MCC: ${data.mcc || 'N/A'}\n`;
-        resultMsg += `MNC: ${data.mnc || 'N/A'}\n`;
-        resultMsg += `IMSI: ${data.imsi || 'N/A'}\n`;
-        resultMsg += `MSIN: ${data.msin || 'N/A'}\n`;
-        resultMsg += `MSC: ${data.msc || 'N/A'}\n`;
-        resultMsg += `Network Name: ${data.original_network_name || 'N/A'}\n`;
-        resultMsg += `Country Name: ${data.original_country_name || 'N/A'}\n`;
-        resultMsg += `Country Code: ${data.original_country_code || 'N/A'}\n`;
-        resultMsg += `Country PREFIX: ${data.original_country_prefix || 'N/A'}\n`;
-        resultMsg += `PORTED: ${data.is_ported ? 'TRUE' : 'FALSE'}\n`;
-        resultMsg += `PORTED NETWORK Name: ${data.ported_network_name || 'NULL'}\n`;
-        resultMsg += `PORTED Country Name: ${data.ported_country_name || 'NULL'}\n`;
-        resultMsg += `PORTED Country Code: ${data.ported_country_code || 'NULL'}\n`;
-        resultMsg += `Roaming: ${data.is_roaming ? 'Yes' : 'No'}\n`;
-        resultMsg += `DATE: ${data.timestamp || 'N/A'}`;
+  let msisdn = rawMsisdn;
 
-        console.log(`success HLR Lookup: ${msisdn}`);
-        return reply(event.replyToken, {
-          type: 'text',
-          text: resultMsg
-        });
-      } else {
-        console.error(`error HLR Lookup failed: ${msisdn} - Status: ${response.status}`);
-        return reply(event.replyToken, {
-          type: 'text',
-          text: `Error: Could not retrieve data (Status: ${response.status})`
-        });
-      }
-    } catch (error) {
-      console.error(`error HLR Lookup Error: ${error.message}`);
-      return reply(event.replyToken, {
-        type: 'text',
-        text: 'Error: HLR lookup failed - ' + error.message
-      });
-    }
+
+  // 0877315866 -> 66877315866
+  if (/^0\d{9}$/.test(msisdn)) {
+
+    msisdn =
+      '66' +
+      msisdn.substring(1);
+
   }
+
+  // +66877315866 -> 66877315866
+  else if (/^\+66\d{9}$/.test(msisdn)) {
+
+    msisdn =
+      msisdn.substring(1);
+
+  }
+
+  // 66877315866 ใช้ได้เลย
+  else if (/^66\d{9}$/.test(msisdn)) {
+
+    // ไม่ต้องแปลง
+
+  }
+
+  // รูปแบบอื่น
+  else {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`❌ รูปแบบหมายเลขไม่ถูกต้อง
+
+ตัวอย่าง
+%0877315866
+%66877315866
+%+66877315866`
+      }
+    );
+  }
+
+
+  try {
+    const response = await fetchHlrLookup(msisdn);
+
+    if (response.status === 200) {
+      const data = response.data;
+
+      // ตัด + ออกจากเบอร์ เช่น +66952290729 -> 66952290729
+      const formattedMsisdn = (data.msisdn || msisdn)
+        .toString()
+        .replace(/^\+/, '');
+
+      // ตัด milliseconds และ timezone ออกจากเวลา
+      // เช่น 2026-08-11 21:02:42.269+0700
+      // -> 2026-08-11 21:02:42
+      const formattedDate = data.timestamp
+        ? data.timestamp.toString().substring(0, 19)
+        : 'N/A';
+
+      const rawStatus =
+  String(
+    data.connectivity_status || 'N/A'
+  )
+    .trim()
+    .toUpperCase();
+
+const statusThai = {
+  CONNECTED: '🟢 เชื่อมต่อ',
+  DISCONNECTED: '🔴 ไม่เชื่อมต่อ',
+  UNKNOWN: '⚪ ไม่ทราบสถานะ',
+  ABSENT: '⚪ ปิดเครื่อง/ไม่เชื่อมต่อ',
+  N_A: '⚪ ไม่มีข้อมูล'
+}[rawStatus] || rawStatus;
+
+
+// แปลประเทศ
+const countryThai =
+  String(data.original_country_name || '')
+    .toLowerCase() === 'thailand'
+    ? 'ประเทศไทย'
+    : (data.original_country_name || '-');
+
+
+const portedCountryThai =
+  String(data.ported_country_name || '')
+    .toLowerCase() === 'thailand'
+    ? 'ประเทศไทย'
+    : (data.ported_country_name || '-');
+
+
+// สถานะย้ายค่าย
+const portedThai =
+  data.is_ported
+    ? '✅ ย้ายค่ายแล้ว'
+    : '❌ ไม่ได้ย้ายค่าย';
+
+
+// สถานะ Roaming
+const roamingThai =
+  data.is_roaming
+    ? '✅ ใช้งานโรมมิ่ง'
+    : '❌ ไม่ได้โรมมิ่ง';
+
+
+let resultMsg =
+`📱 ข้อมูลหมายเลขโทรศัพท์
+
+🕒 วันที่ตรวจสอบ : ${formattedDate}
+📞 หมายเลข : ${formattedMsisdn}
+
+📶 สถานะหมายเลข : ${statusThai}
+
+🌐 ข้อมูลเครือข่ายหลัก
+MCC : ${data.mcc || '-'}
+MNC : ${data.mnc || '-'}
+
+🆔 IMSI : ${data.imsi || '-'}
+🔢 MSIN : ${data.msin || '-'}
+📡 MSC : ${data.msc || '-'}
+
+🏢 เครือข่ายเดิม : ${data.original_network_name || '-'}
+🌏 ประเทศ : ${countryThai}
+🏳️ รหัสประเทศ : ${data.original_country_code || '-'}
+☎️ รหัสโทรศัพท์ประเทศ : +${data.original_country_prefix || '-'}
+
+🔄 การย้ายค่าย : ${portedThai}
+📡 เครือข่ายปัจจุบัน : ${data.ported_network_name || '-'}
+🌏 ประเทศเครือข่ายปัจจุบัน : ${portedCountryThai}
+🏳️ รหัสประเทศ : ${data.ported_country_code || '-'}
+
+✈️ โรมมิ่ง : ${roamingThai}`;
+
+      console.log(`success HLR Lookup: ${msisdn}`);
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text: resultMsg
+      });
+
+    } else {
+      console.error(
+        `error HLR Lookup failed: ${msisdn} - Status: ${response.status}`
+      );
+
+      return reply(event.replyToken, {
+  type: 'text',
+  text:
+    'ระบบอัพเดทประจำรอบ\n' +
+    'กรุณาสืบค้นใหม่อีกครั้งในไม่ช้า❗'
+});
+    }
+
+  } catch (error) {
+    console.error(`error HLR Lookup Error: ${error.message}`);
+
+    return reply(event.replyToken, {
+  type: 'text',
+  text:
+    'ระบบอัพเดทประจำรอบ\n' +
+    'กรุณาสืบค้นใหม่อีกครั้งในไม่ช้า❗'
+});
+  }
+}
 
   if (/^s%\d{13}$/.test(text)) {
     const nationId = text.replace(/^s%/, '').trim();
@@ -7316,9 +29052,33 @@ if (text === 'face%') {
 
       return reply(event.replyToken, {
         type: 'text',
-        text: '❌ ดึงข้อมูลผ่อนสินค้าไม่สำเร็จ'
+        text: '🔎 คำสั่งนี้ทำการปรับปรุง'
       });
     }
+  }
+
+  // ประวัติการผ่อนสินค้า Siam: sc%เลขบัตร
+  if (/^sc%\d{13}$/.test(text)) {
+    const nationId = text.replace(/^sc%/, '').trim();
+
+    try {
+  const result = await fetchSiamInstallment(nationId);
+
+  const msg = formatSiamInstallment(result, nationId);
+
+return reply(event.replyToken, {
+  type: 'text',
+  text: msg
+});
+
+} catch (err) {
+  console.error('sc% lookup error:', err?.response?.data || err.message);
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text: '❌ ดึงข้อมูลประวัติการผ่อนสินค้าไม่สำเร็จ'
+  });
+}
   }
 
   if (/^c#\d{13}$/.test(text)) {
@@ -7345,18 +29105,577 @@ buildCrimeFlex(result, nationId)
     }
   }
 
-  if (text.startsWith('?')) {
-    const phone = text.substring(1).trim();
-    if (!phone) {
-      return reply(event.replyToken, {
-        type: 'text',
-        text: 'กรุณาระบุเบอร์โทรศัพท์\nตัวอย่าง: ?0812345678'
-      });
-    }
+// ========================================
+// support% ช่องทางสนับสนุนเซิร์ฟเวอร์
+// ========================================
+if (text.trim().toLowerCase() === 'support%') {
 
-    const result = await fetchCallerInfo(phone);
-    return reply(event.replyToken, result);
+  const QR_CODE_URL =
+    'https://cdn.phototourl.com/free/2026-08-29-d3986088-0eed-413f-badd-1631cf888833.jpg';
+
+  return reply(event.replyToken, {
+    type: 'flex',
+    altText: 'ช่องทางสนับสนุนเซิฟเวอร์',
+
+    contents: {
+      type: 'carousel',
+      contents: [
+
+        // ========================================
+        // ใบที่ 1 : QR สนับสนุน
+        // ========================================
+        {
+          type: 'bubble',
+          size: 'mega',
+
+          header: {
+            type: 'box',
+            layout: 'vertical',
+            backgroundColor: '#0F172A',
+            paddingAll: '18px',
+            contents: [
+              {
+                type: 'text',
+                text: 'ช่องทางสนับสนุนเซิฟเวอร์',
+                color: '#FFFFFF',
+                weight: 'bold',
+                size: 'xl',
+                align: 'center',
+                wrap: true
+              }
+            ]
+          },
+
+          body: {
+            type: 'box',
+            layout: 'vertical',
+            backgroundColor: '#FFFFFF',
+            paddingAll: '20px',
+            spacing: 'md',
+            contents: [
+              {
+                type: 'text',
+                text: 'สแกนที่คิวอาร์โค้ดด้านล่างได้เลยครับ',
+                size: 'md',
+                color: '#334155',
+                align: 'center',
+                wrap: true
+              },
+              {
+                type: 'image',
+                url: QR_CODE_URL,
+                size: 'full',
+                aspectRatio: '1:1',
+                aspectMode: 'fit',
+                margin: 'lg'
+              }
+            ]
+          },
+
+          footer: {
+            type: 'box',
+            layout: 'vertical',
+            backgroundColor: '#FFFFFF',
+            paddingAll: '16px',
+            contents: [
+              {
+                type: 'button',
+                style: 'primary',
+                height: 'md',
+                color: '#0F172A',
+                action: {
+                  type: 'message',
+                  label: 'แจ้งสลิปสนับสนุน',
+                  text: 'แจ้งสลิปสนับสนุน'
+                }
+              }
+            ]
+          }
+        },
+
+        // ========================================
+        // ใบที่ 2 : แพ็กเกจ
+        // ========================================
+        {
+          type: 'bubble',
+          size: 'mega',
+
+          header: {
+            type: 'box',
+            layout: 'vertical',
+            backgroundColor: '#1D4ED8',
+            paddingAll: '18px',
+            contents: [
+              {
+                type: 'text',
+                text: 'แพ็กเกจสนับสนุน',
+                color: '#FFFFFF',
+                weight: 'bold',
+                size: 'xl',
+                align: 'center'
+              },
+              {
+                type: 'text',
+                text: 'เลือกระยะเวลาที่ต้องการ',
+                color: '#DBEAFE',
+                size: 'sm',
+                align: 'center',
+                margin: 'sm'
+              }
+            ]
+          },
+
+          body: {
+            type: 'box',
+            layout: 'vertical',
+            paddingAll: '18px',
+            spacing: 'md',
+            contents: [
+              {
+                type: 'text',
+                text: '1 เดือน',
+                weight: 'bold',
+                size: 'lg'
+              },
+              {
+                type: 'text',
+                text: '499 บาท',
+                color: '#2563EB',
+                weight: 'bold'
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '3 เดือน',
+                weight: 'bold',
+                size: 'lg',
+                margin: 'md'
+              },
+              {
+                type: 'text',
+                text: '1,299 บาท',
+                color: '#2563EB',
+                weight: 'bold'
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '6 เดือน',
+                weight: 'bold',
+                size: 'lg',
+                margin: 'md'
+              },
+              {
+                type: 'text',
+                text: '2,599 บาท',
+                color: '#2563EB',
+                weight: 'bold'
+              },
+
+              {
+                type: 'separator',
+                margin: 'md'
+              },
+
+              {
+                type: 'text',
+                text: '12 เดือน',
+                weight: 'bold',
+                size: 'lg',
+                margin: 'md'
+              },
+              {
+                type: 'text',
+                text: '4,499 บาท',
+                color: '#2563EB',
+                weight: 'bold'
+              }
+            ]
+          },
+
+          footer: {
+            type: 'box',
+            layout: 'vertical',
+            spacing: 'sm',
+            paddingAll: '16px',
+            contents: [
+              {
+                type: 'button',
+                style: 'primary',
+                color: '#1D4ED8',
+                action: {
+                  type: 'message',
+                  label: 'เลือก 1 เดือน',
+                  text: 'สนับสนุนแพ็กเกจ 1 เดือน 499 บาท'
+                }
+              },
+              {
+                type: 'button',
+                style: 'primary',
+                color: '#1D4ED8',
+                action: {
+                  type: 'message',
+                  label: 'เลือก 3 เดือน',
+                  text: 'สนับสนุนแพ็กเกจ 3 เดือน 1299 บาท'
+                }
+              },
+              {
+                type: 'button',
+                style: 'primary',
+                color: '#1D4ED8',
+                action: {
+                  type: 'message',
+                  label: 'เลือก 6 เดือน',
+                  text: 'สนับสนุนแพ็กเกจ 6 เดือน 2599 บาท'
+                }
+              },
+              {
+                type: 'button',
+                style: 'primary',
+                color: '#1D4ED8',
+                action: {
+                  type: 'message',
+                  label: 'เลือก 12 เดือน',
+                  text: 'สนับสนุนแพ็กเกจ 12 เดือน 4499 บาท'
+                }
+              }
+            ]
+          }
+        },
+
+        // ========================================
+        // ใบที่ 3 : โมดูลเสริม
+        // ========================================
+        {
+          type: 'bubble',
+          size: 'mega',
+
+          header: {
+            type: 'box',
+            layout: 'vertical',
+            backgroundColor: '#7C3AED',
+            paddingAll: '18px',
+            contents: [
+              {
+                type: 'text',
+                text: 'โมดูลเสริม',
+                color: '#FFFFFF',
+                weight: 'bold',
+                size: 'xl',
+                align: 'center'
+              },
+              {
+                type: 'text',
+                text: 'สามารถเลือกเพิ่มแยกได้',
+                color: '#EDE9FE',
+                size: 'sm',
+                align: 'center',
+                margin: 'sm'
+              }
+            ]
+          },
+
+          body: {
+            type: 'box',
+            layout: 'vertical',
+            paddingAll: '18px',
+            spacing: 'lg',
+            contents: [
+              {
+                type: 'box',
+                layout: 'vertical',
+                contents: [
+                  {
+                    type: 'text',
+                    text: 'AIS',
+                    weight: 'bold',
+                    size: 'xl'
+                  },
+                  {
+                    type: 'text',
+                    text: 'เพิ่มคำสั่ง AIS',
+                    size: 'sm',
+                    color: '#64748B',
+                    margin: 'sm'
+                  },
+                  {
+                    type: 'text',
+                    text: '499 บาท',
+                    weight: 'bold',
+                    color: '#7C3AED',
+                    size: 'lg',
+                    margin: 'sm'
+                  }
+                ]
+              },
+
+              {
+                type: 'separator'
+              },
+
+              {
+                type: 'box',
+                layout: 'vertical',
+                contents: [
+                  {
+                    type: 'text',
+                    text: 'พัสดุละเอียด',
+                    weight: 'bold',
+                    size: 'xl'
+                  },
+                  {
+                    type: 'text',
+                    text: 'เพิ่มคำสั่งพัสดุแบบละเอียด',
+                    size: 'sm',
+                    color: '#64748B',
+                    margin: 'sm'
+                  },
+                  {
+                    type: 'text',
+                    text: '499 บาท',
+                    weight: 'bold',
+                    color: '#7C3AED',
+                    size: 'lg',
+                    margin: 'sm'
+                  }
+                ]
+              }
+            ]
+          },
+
+          footer: {
+            type: 'box',
+            layout: 'vertical',
+            spacing: 'sm',
+            paddingAll: '16px',
+            contents: [
+              {
+                type: 'button',
+                style: 'primary',
+                color: '#7C3AED',
+                action: {
+                  type: 'message',
+                  label: 'เพิ่ม AIS 499',
+                  text: 'ขอเพิ่มโมดูล AIS 499 บาท'
+                }
+              },
+              {
+                type: 'button',
+                style: 'primary',
+                color: '#7C3AED',
+                action: {
+                  type: 'message',
+                  label: 'เพิ่มพัสดุละเอียด 499',
+                  text: 'ขอเพิ่มโมดูลพัสดุละเอียด 499 บาท'
+                }
+              }
+            ]
+          }
+        }
+
+      ]
+    }
+  });
+}
+
+  if (text.startsWith('?')) {
+  const phone = text.substring(1).trim();
+
+  if (!phone) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: 'กรุณาระบุเบอร์โทรศัพท์\nตัวอย่าง : ?0812345678'
+    });
   }
+
+  const result = await fetchCallerInfo(phone);
+  return reply(event.replyToken, result);
+}
+
+// =====================================
+// ค้นหาสาขา : se%
+// =====================================
+if (
+  text
+    .toLowerCase()
+    .startsWith('se%')
+) {
+
+  const keyword =
+    text
+      .replace(/^se%/i, '')
+      .trim();
+
+
+  if (!keyword) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`❌ กรุณาระบุข้อมูลที่ต้องการค้นหา
+
+ตัวอย่าง
+se%3190
+se%ปตท.ด่านช้าง
+se%สุพรรณบุรี`
+      }
+    );
+  }
+
+
+  try {
+
+    const stores =
+      await fetchStoreListApi();
+
+
+    const results =
+      searchStores(
+        stores,
+        keyword
+      );
+
+
+    const resultText =
+      formatStoreSearchResult(
+        results,
+        keyword
+      );
+
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text: resultText
+      }
+    );
+
+
+  } catch (err) {
+
+    console.error(
+      'se% store lookup error:',
+      err?.response?.data ||
+      err.message
+    );
+
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+          '❌ ไม่สามารถค้นหาข้อมูลสาขาได้ กรุณาลองใหม่'
+      }
+    );
+  }
+}
+
+if (text === 'menu#') {
+  return reply(event.replyToken, {
+    type: 'text',
+    text: `📂คำค้นในระบบ
+
+• %66xxxxxxxxx → ตรวจสอบปิด/เปิดเครื่อง
+✅ตัวอย่าง: %66812345678
+• ?เบอร์โทร → ตรวจเครือข่ายเบอร์
+• a#เบอร์โทร/เลขบัตร → จด AIS (สมัครเพิ่ม)
+• d#เบอร์โทร/เลขบัตร → จด DTAC
+• t#เบอร์ → จด TRUE
+• tid#เลขบัตร → จด TRUE
+• tn#ชื่อ-นามสกุล → จด TRUE
+• tv#เลขกล่อง TV Fiber → จุดติดตั้งข้อมูล
+⚠️ ระบบ TRUE อาจไม่สามารถค้นหาได้บางรายการ
+🙏 ขออภัยในความไม่สะดวก
+
+• f#เบอร์โทร → พัสดุทั่วไป
+• fx#เบอร์โทร/ชื่อสกุล → พัสดุแบบละเอียด (สมัครเพิ่ม)
+• tic%เลขพัสดุ → ภาพรับพัสดุ
+
+• bn%ชื่อธนาคาร/รหัสสาขา → ค้นหาข้อมูลธนาคาร
+• atm%รหัสตู้ → จุดติดตั้ง ATM
+• cell%LAC,CID → พิกัด Cell
+
+• pid%เลขบัตร → ตรวจสอบสิทธิ
+• h#เลขบัตร → ตรวจสอบข้อมูลการรักษา
+• nm%รหัสหน่วยบริการ/ชื่อสถานพยาบาล → ค้นหาสถานพยาบาล
+
+• st%เลขบัตรบุตร → ตรวจสอบข้อมูลการศึกษา
+• ใช้เลขบัตรของบุตรเท่านั้น
+
+• si%เลขบัตร → ตรวจสอบประกันสังคม
+• dc%ชื่อ สกุล → ตรวจสอบแพทย์
+• dl#เลขบัตร → ตรวจสอบใบขับขี่
+• pb%เลขบัตร → ตรวจสอบคุมประพฤติ
+• nb%เลขบัตร → ตรวจสอบประวัติคดียาเสพติด
+• psi#เลขบัตร → ตรวจสอบผู้ต้องขัง
+• ps#เลขบัตร → ผู้ต้องขังยังไม่พิพากษา
+• wf%เลขบัตร → เบี้ยยังชีพ
+• kp%เลขบัตร/เลขสมาชิก → ตรวจสอบสมาชิก สก.ทบ.
+
+• dbd%เลขนิติบุคคล → ข้อมูลจดทะเบียนนิติบุคคล
+
+• c#เลขบัตร → หมายจับ CRIME
+• doc#เลขบัตร → หมายจับศาล
+
+• cid#เลขบัตร → ตรวจจากเลขบัตร
+• car#จังหวัด หมวด ตัวเลข ประเภทรถ → ตรวจจากทะเบียน
+• ตัวอย่าง: car#กรุงเทพ 1กก 334 1
+• pt% → อ่านป้ายทะเบียนและวิเคราะห์รถ
+• รอระบบแจ้งให้ส่งภาพ
+• tro%หมวดอักษร หมวดตัวเลข จังหวัด → ตรวจสอบเข้า ตรอ.
+• ตัวอย่าง: tro%1กก 334 กรุงเทพ
+
+• ff% → เปรียบเทียบใบหน้า
+• รอระบบแจ้งให้ส่งภาพ
+
+• mea%ชื่อสกุล → ข้อมูลไฟฟ้า MEA
+• kru%เลขมิเตอร์ → ตรวจสอบมิเตอร์
+• peab%เลขCA เว้นวรรค เลขมิเตอร์ → ประวัติใช้ไฟ
+• peac%เลข CA → ข้อมูลจาก CA
+• pean%ชื่อสกุล → ข้อมูลจากชื่อสกุล
+• peau%ที่อยู่ → ข้อมูลจากที่อยู่
+
+• phis%URL → เพิ่ม Phishing
+• chphis%ID → ตรวจ Phishing
+• picf%url → ดึงภาพ Profile Facebook
+• dr%ชื่อ สกุล → ข้อมูลแพทย์/บุคลากรสาธารณสุข
+• soc%Username/ชื่อโซเชียล → ค้นหาโซเชียล
+• ip%เลข IP → ตรวจเครือข่าย IP
+• imei%เลข IMEI → ตรวจ IMEI
+• imsi%เลข IMSI → ตรวจ IMSI
+• icc%เลข ICCID → ตรวจเลขซิม
+• web%ชื่อเว็บไซต์ → ตรวจเว็บไซต์
+• dis%พิกัดต้นทาง/พิกัดปลายทาง → ระยะทาง
+• map%ละติจูด,ลองจิจูด → พิกัด MAP
+• lw%คำถาม → ค้นหาข้อกฎหมาย
+
+• cj%เบอร์ เลขบัตร → สมาชิก CJ
+• se%รหัสสาขา7-11 → สาขาเซเว่น
+• lc%ชื่อ-สกุล,ชื่อบริษัท → ใบอนุญาตบริษัท
+• loa%ชื่อแอป → ตรวจสอบแอปเงินกู้
+• for%เลขนิติ → ทะเบียนพาณิชย์/นิติบุคคล
+• tr%ชื่อผู้ประกอบการ → ผู้ประกอบการขนส่ง
+• cctv%เวลากล้อง,เวลาจริง → เปรียบเทียบเวลากล้อง
+• tisi%เลขมอก. → ตรวจมาตรฐาน มอก.
+• s%เลขบัตร → ผ่อนเครื่องใช้ไฟฟ้า
+• sc%เลขบัตร → ประวัติการผ่อนสินค้า
+• bq%เบอร์โทร/เลขบัตร → ศูนย์บริการรถ`
+  });
+}
 
   if (text.startsWith('regis%')) {
     const raw = text.replace(/^regis%/i, '').trim();
@@ -7388,7 +29707,7 @@ buildCrimeFlex(result, nationId)
     if (db.members[userId] && ['pending', 'approved'].includes(db.members[userId].status)) {
       return reply(event.replyToken, {
         type: 'text',
-        text: 'คุณเคยสมัครแล้ว ระบบมีข้อมูลของคุณอยู่แล้ว'
+        text: 'ท่านสมัครแล้วเรียบร้อย กรุณาติดต่อแอดมิน✅ '
       });
     }
 
@@ -7416,11 +29735,16 @@ buildCrimeFlex(result, nationId)
     saveDB(db);
 
     return reply(event.replyToken, {
-      type: 'text',
-      text:
-        '✅บันทึกข้อมูลสมัครเรียบร้อยแล้ว\n' +
-        '🪪กรุณารูภาพบัตรข้าราชการทางRTP4Mหรือเอกสารที่ยืนยันตัวตนข้าราชการ'
-    });
+  type: 'text',
+  text:
+`🪪 กรุณาส่งรูปภาพบัตรข้าราชการอิเล็กทรอนิกส์ หรือ เอกสารที่ยืนยันตัวตนข้าราชการ
+
+🚨 สำคัญ
+หากไม่ส่งภาพบัตรข้าราชการหรือเอกสารยืนยันตัวตน
+แอดมินจะไม่ทำการตรวจสอบและอนุมัติการสมัคร
+
+🙏 ขอความร่วมมือส่งเอกสารให้ครบถ้วนเพื่อความรวดเร็วในการอนุมัติ`
+});
   }
 
   if (text === 'members_all') {
@@ -7616,15 +29940,12 @@ const res=await axios.get(url,{
 timeout:45000
 });
 
-const msg=formatDtacSearch(
-res.data,
-phone
+const msg = formatDtacSearchFlex(
+  res.data,
+  phone
 );
 
-return reply(event.replyToken,{
-type:'text',
-text:msg
-});
+return reply(event.replyToken, msg);
 
 }catch(err){
 
@@ -7708,8 +30029,24 @@ if (text.startsWith('soc%')) {
     }
 
     try {
-      const data = await fetchDPlusCustomerApi(phone);
-      return reply(event.replyToken, { type: 'text', text: formatDPlusCustomers(data, phone) });
+      const data =
+  await fetchDPlusCustomerApi(phone);
+
+return reply(
+  event.replyToken,
+
+  addSearchAudit(
+    {
+      type: 'text',
+      text:
+        formatDPlusCustomers(
+          data,
+          phone
+        )
+    },
+    member
+  )
+);
     } catch (err) {
       console.error('dplus customer error:', err?.response?.data || err.message);
       return reply(event.replyToken, { type: 'text', text: '❌ ดึงข้อมูลไม่สำเร็จ: ' + err.message });
@@ -7732,6 +30069,34 @@ if (text.startsWith('soc%')) {
   type: 'text', 
   text: '⌛กรุณาสืบค้นใหม่อีกครั้ง⌛'
 });
+    }
+  }
+
+  // LeakOSINT: uf%คำค้นหา
+  if (text.startsWith('uf%')) {
+    const rawQuery = text.replace(/^uf%/i, '').trim();
+    const pageMatch = rawQuery.match(/\s+(\d+)$/);
+    const page = pageMatch ? Math.max(1, Number(pageMatch[1])) : 1;
+    const query = pageMatch ? rawQuery.slice(0, pageMatch.index).trim() : rawQuery;
+    if (!query) {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌ กรุณาระบุข้อมูลที่ต้องการค้นหา เช่น uf%example@gmail.com หรือ uf%example@gmail.com 2'
+      });
+    }
+
+    try {
+      const result = await fetchLeakOsintApi(query);
+      return reply(event.replyToken, {
+        type: 'text',
+        text: formatLeakOsintResult(result, query, page)
+      });
+    } catch (err) {
+      console.error('uf lookup error:', err?.response?.data || err.message);
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌ ค้นหา LeakOSINT ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง'
+      });
     }
   }
 
@@ -7788,123 +30153,669 @@ if (text.startsWith('soc%')) {
       });
     } catch (err) {
       console.error('opec student error:', err?.response?.data || err.message);
-      return reply(event.replyToken, { type: 'text', text: '❌ ดึงข้อมูลนักเรียน OPEC ไม่สำเร็จ' });
+      return reply(event.replyToken, { type: 'text', text: '❌ ไม่พบข้อมูล' });
     }
   }
 
-  // ประกันสังคม: si%เลขบัตร
-  if (text.startsWith('si%')) {
-    const registeredPhone =
-member?.phone ||
-member?.tel ||
-member?.mobile ||
-'';
+  /// =====================================
+// ประกันสังคม : si%เลขบัตร
+// =====================================
+if (text.startsWith('si%')) {
 
-const isSiBlocked =
-db.siBlocked?.[registeredPhone] === true;
+  const registeredPhone =
+    String(
+      member?.phone ||
+      member?.tel ||
+      member?.mobile ||
+      ''
+    )
+      .replace(/\D/g, '');
 
-if(isSiBlocked){
-return reply(event.replyToken,{
-type:'text',
-text:`⛔สิทธิ์สืบค้นคำสั่งประกันสังคมถูกยกเลิกแล้ว⛔
 
-📂ต้องการใช้งานติดต่อ admin📂
-Contact Admin:
-https://line.me/ti/p/mVmD-ncfvU
-------------`
-});
-}
+  const isSiBlocked =
+    db.siBlocked?.[
+      registeredPhone
+    ] === true;
+
+
+  // =====================================
+  // สมาชิกถูกระงับคำสั่ง si%
+  // =====================================
+  if (isSiBlocked) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+`ระบบทำการปรับปรุง⚠️
+ขออภัยในความไม่สะดวก🙏`
+      }
+    );
+  }
     const ssoNum = text.replace(/^si%/, '').trim();
     if (!ssoNum) return reply(event.replyToken, { type: 'text', text: '❌ กรุณาระบุเลขบัตรประชาชน เช่น si%1234567890123' });
     try {
-      const res = await fetchSearchApiRaw({ si: ssoNum });
-      if (!res.success) return reply(event.replyToken, { type: 'text', text: `❌ ${res.message || 'ดึงข้อมูลไม่สำเร็จ'}` });
-      const data = res.data;
-      if (data.content && data.content.length > 0) {
-        let result = `🔎ประวัติการทำงานประกันสังคม\n-------------------\n🆔เลขประกันสังคม:${ssoNum}\n📊จำนวนที่พบ:${data.totalElements}รายการ\n`;
-        data.content.forEach((item, idx) => {
-          result += `\n 🏢 บริษัท ${idx + 1}\n`;
-          result += `┌●ชื่อบริษัท: ${item.companyName || '-'}\n`;
-          result += `├●รหัสสาขา: ${item.accBran || item.branchCode || '-'}\n`;
-          result += `├●เลขที่บัญชี: ${item.accNo || item.accountNo || '-'}\n`;
-          result += `├●วันที่เริ่มงาน: ${item.expStartDateText || '-'}\n`;
-          result += `├●วันที่ลาออก: ${item.empResignDateText || '-'}\n`;
-          result += `└●สถานะ: ${item.employStatusDesc || '-'}\n`;
-        });
-        return reply(event.replyToken, { type: 'text', text: result });
-      } else {
-        return reply(event.replyToken, { type: 'text', text: 'ไม่พบข้อมูลประวัติการทำงานประกันสังคม' });
+      const doGet = async (base) => {
+        const { data } = await axios.get(
+          `${base}?si=${encodeURIComponent(ssoNum)}&key=${encodeURIComponent(SEARCH_API_KEY)}`,
+          {
+            timeout: 30000,
+            headers: {
+              Accept: 'application/json, text/plain, */*',
+              'Accept-Language': 'th-TH,th;q=0.9,en;q=0.8',
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
+            }
+          }
+        );
+        return data;
+      };
+
+      let res;
+      try {
+        res = await doGet(SECURE_SEARCH_API_BASE);
+      } catch (err) {
+        console.error('si% หลักล่ม ใช้สำรอง:', err?.response?.data || err.message);
+        res = await doGet(DXC_BACKUP_API_BASE);
       }
+      if (!res.success) {
+        return reply(event.replyToken, {
+          type: 'text',
+          text: 'ไม่พบข้อมูลประกันสังคม⛔'
+        });
+      }
+      const data = res.data;
+
+if (data.content && data.content.length > 0) {
+
+  let result =
+  `🔎: ${ssoNum}\n` +
+  `✅ พบข้อมูล : ${data.content.length} รายการ\n\n` +
+  `-  -  -  -  -  -  -  -  -  -\n`;
+
+const numberEmoji = [
+  '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣',
+  '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'
+];
+
+const displayItems = data.content.slice(0, 10);
+
+displayItems.forEach((item, idx) => {
+  const number = numberEmoji[idx] || `${idx + 1}️⃣`;
+
+  const status =
+    item.employStatusDesc ||
+    '-';
+
+  const statusIcon =
+    String(status).trim().toUpperCase() === 'ACTIVE'
+      ? '🟢'
+      : '🔴';
+
+  result +=
+    `\n${number}\n` +
+    `🏢 บริษัท: ${item.companyName || item.company || '-'}\n` +
+    `🔢 รหัสสาขา: ${item.accBran || item.branchCode || '-'}\n` +
+    `${statusIcon} สถานะ: ${status}\n` +
+    `📅 วันที่เริ่มงาน: ${item.expStartDateText || '-'}\n` +
+    `📅 วันที่สิ้นสุด: ${item.empResignDateText || '-'}\n`;
+});
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text: result
+  });
+
+} else {
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text: 'ไม่พบข้อมูลประวัติการทำงานประกันสังคม'
+  });
+
+}
     } catch (err) {
-      return reply(event.replyToken, { type: 'text', text: '❌ ดึงข้อมูลประกันสังคมไม่สำเร็จ' });
+      const responseData = err?.response?.data;
+      const reason = responseData
+        ? (typeof responseData === 'string' ? responseData : JSON.stringify(responseData, null, 2))
+        : (err?.message || String(err));
+      const status = err?.response?.status ? `HTTP ${err.response.status}: ` : '';
+      console.error('si lookup error:', responseData || err.message);
+      return reply(event.replyToken, {
+        type: 'text',
+        text: `❌ER ระบบปรับปรุงชั่วคราว:\n${status}${reason.slice(0, 4500)}`
+      });
     }
   }
 
   // หมายศาล: doc#เลขบัตร [หน้า]
-  if (text.startsWith('doc#')) {
-    const payload = text.replace(/^doc#/, '').trim();
-    const parts = payload.split(/\s+/);
-    const accCardId = parts[0];
-    let page = parts[1] ? parseInt(parts[1]) - 1 : 0;
-    if (!accCardId) return reply(event.replyToken, { type: 'text', text: '❌ กรุณาระบุเลขบัตรประชาชน เช่น doc#1234567890123' });
-    try {
-      const res = await fetchSearchApiRaw({ doc: accCardId });
-      if (!res.success) return reply(event.replyToken, { type: 'text', text: `❌ ${res.message || 'ดึงข้อมูลไม่สำเร็จ'}` });
-      const data = res.data;
-      if (data.content && data.content.length > 0) {
-        const itemsPerPage = 3;
-        const totalPages = Math.ceil(data.content.length / itemsPerPage);
-        if (isNaN(page) || page < 0) page = 0;
-        if (page >= totalPages) return reply(event.replyToken, { type: 'text', text: `ไม่พบข้อมูลหน้าที่ ${page + 1} (มีทั้งหมด ${totalPages} หน้า)` });
-        const startIndex = page * itemsPerPage;
-        const pageItems = data.content.slice(startIndex, Math.min(startIndex + itemsPerPage, data.content.length));
-        let result = `🔎ข้อมูลหมายจับศาล(หน้า ${page + 1}/${totalPages})\n- - - - - - - - - - - - -\n`;
-        pageItems.forEach((warrant, idx) => {
-          result += `\n📄 หมายจับที่ ${startIndex + idx + 1}\n`;
+if (text.startsWith('doc#')) {
+  const payload = text.replace(/^doc#/, '').trim();
+  const parts = payload.split(/\s+/);
 
-          result += `┌● เลขที่: ${warrant.woaNo || '-'} / ${warrant.woaYear || '-'}\n`;
-          result += `├● ศาล: ${warrant.courtCodeText || '-'}\n`;
-          result += `├● สถานะ: ${warrant.arrestStatus || '-'}\n`;
-          result += `├● ข้อหา: ${warrant.charge || '-'}\n`;
-          result += `├● ผู้เสัยหาย: ${warrant.plaintiff || '-'}\n`;
-          result += `├● ผู้พิพากษา: ${warrant.judgeName || '-'}\n`;
-          result += `├● ออกหมาย: ${warrant.woaDate ? new Date(warrant.woaDate).toLocaleDateString('th-TH') : '-'}\n`;
-          result += `├● เริ่มต้น: ${warrant.woaStartDate ? new Date(warrant.woaStartDate).toLocaleDateString('th-TH') : '-'}\n`;
-          result += `└● สิ้นสุด: ${warrant.woaEndDate ? new Date(warrant.woaEndDate).toLocaleDateString('th-TH') : '-'}\n`;
-        });
-        result += `\n📊แสดง ${pageItems.length} จาก ${data.content.length} รายการ`;
-        if (totalPages > 1) result += `\nพิมพ์ doc#${accCardId} [1-${totalPages}] เพื่อดูหน้าอื่น`;
-        return reply(event.replyToken, { type: 'text', text: result });
-      } else {
-        return reply(event.replyToken, { type: 'text', text: 'ไม่พบข้อมูลหมายศาล' });
+  const accCardId = parts[0];
+  let page = parts[1] ? parseInt(parts[1]) - 1 : 0;
+
+  if (!accCardId) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ กรุณาระบุเลขบัตรประชาชน เช่น doc#1234567890123'
+    });
+  }
+
+  try {
+    const res = await fetchSearchApiRaw(
+      { doc: accCardId },
+      SECURE_SEARCH_API_BASE
+    );
+
+    if (!res.success) {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: `❌ ${res.message || '❌ER ระบบปรับปรุงชั่วคราว'}`
+      });
+    }
+
+    const data = res.data;
+
+    if (data.content && data.content.length > 0) {
+      const itemsPerPage = 3;
+      const totalPages = Math.ceil(
+        data.content.length / itemsPerPage
+      );
+
+      if (isNaN(page) || page < 0) {
+        page = 0;
       }
-    } catch (err) {
-      return reply(event.replyToken, { type: 'text', text: '❌ดึงข้อมูลหมายศาลไม่สำเร็จ' });
+
+      if (page >= totalPages) {
+        return reply(event.replyToken, {
+          type: 'text',
+          text: `ไม่พบข้อมูลหน้าที่ ${page + 1} (มีทั้งหมด ${totalPages} หน้า)`
+        });
+      }
+
+      const startIndex = page * itemsPerPage;
+
+      const pageItems = data.content.slice(
+        startIndex,
+        Math.min(
+          startIndex + itemsPerPage,
+          data.content.length
+        )
+      );
+
+      // แปลงวันที่เป็น DD/MM/YYYY ค.ศ.
+      const formatDate = (value) => {
+        if (!value) return '-';
+
+        const date = new Date(value);
+
+        if (isNaN(date.getTime())) {
+          return '-';
+        }
+
+        return date.toLocaleDateString('en-GB', {
+          timeZone: 'Asia/Bangkok',
+          day: '2-digit',
+          month: '2-digit',
+          year: 'numeric'
+        });
+      };
+
+      // เลขลำดับแบบ emoji
+      const numberIcons = [
+        '1️⃣',
+        '2️⃣',
+        '3️⃣',
+        '4️⃣',
+        '5️⃣',
+        '6️⃣',
+        '7️⃣',
+        '8️⃣',
+        '9️⃣',
+        '🔟'
+      ];
+
+      const bubbles = pageItems.map((warrant, idx) => {
+  const itemNo = startIndex + idx + 1;
+
+  const warrantNo =
+    `${warrant.woaNo || '-'}/${warrant.woaYear || '-'}`;
+
+  const fullName =
+    warrant.accFullName ||
+    warrant.fullName ||
+    warrant.name ||
+    '-';
+
+  const occupation =
+    warrant.accOccupation ||
+    warrant.occupation ||
+    '-';
+
+  const district =
+    warrant.accDistrictText ||
+    warrant.districtText ||
+    warrant.district ||
+    '-';
+
+  const copyText =
+    `🚨 ผลการตรวจสอบหมายจับศาล\n` +
+    `ID: ${accCardId}\n` +
+    `หมายจับที่ ${warrantNo}\n\n` +
+
+    `ชื่อ: ${fullName}\n` +
+    `อาชีพ: ${occupation}\n` +
+    `อำเภอ: ${district}\n\n` +
+
+    `ข้อมูลคดี\n` +
+    `ข้อหา: ${warrant.charge || '-'}\n` +
+    `ศาล: ${warrant.courtCodeText || '-'}\n` +
+    `ประเภทคดี: ${warrant.faultTypeIdText || '-'}\n` +
+    `วันที่ออกหมาย: ${formatDate(warrant.woaDate)}\n` +
+    `สิ้นสุดอายุความ: ${formatDate(warrant.woaEndDate)}\n` +
+    `สถานะ: ${warrant.arrestStatus || '-'}\n\n` +
+
+    `ข้อมูลผู้เกี่ยวข้อง\n` +
+    `ผู้พิพากษา: ${warrant.judgeName || '-'}\n` +
+    `โจทก์: ${warrant.plaintiff || '-'}`;
+
+  return {
+    type: 'bubble',
+    size: 'mega',
+
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      backgroundColor: '#7F1D1D',
+      paddingAll: '18px',
+
+      contents: [
+        {
+          type: 'text',
+          text: `🚨 หมายจับที่ ${warrantNo}`,
+          color: '#FFFFFF',
+          weight: 'bold',
+          size: 'lg',
+          wrap: true
+        },
+        {
+          type: 'text',
+          text: `รายการ ${itemNo} จาก ${data.content.length}`,
+          color: '#FECACA',
+          size: 'sm',
+          margin: 'sm'
+        }
+      ]
+    },
+
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '18px',
+      spacing: 'md',
+
+      contents: [
+        {
+          type: 'text',
+          text: '👤 ข้อมูลบุคคล',
+          weight: 'bold',
+          size: 'md',
+          color: '#0F172A'
+        },
+
+        {
+          type: 'text',
+          text:
+            `ชื่อ: ${fullName}\n` +
+            `อาชีพ: ${occupation}\n` +
+            `อำเภอ: ${district}`,
+          wrap: true,
+          size: 'sm',
+          color: '#334155'
+        },
+
+        {
+          type: 'separator',
+          margin: 'md'
+        },
+
+        {
+          type: 'text',
+          text: '⚖️ ข้อมูลคดี',
+          weight: 'bold',
+          size: 'md',
+          color: '#0F172A',
+          margin: 'md'
+        },
+
+        {
+          type: 'text',
+          text:
+            `ข้อหา: ${warrant.charge || '-'}\n` +
+            `ศาล: ${warrant.courtCodeText || '-'}\n` +
+            `ประเภทคดี: ${warrant.faultTypeIdText || '-'}\n` +
+            `วันที่ออกหมาย: ${formatDate(warrant.woaDate)}\n` +
+            `สิ้นสุดอายุความ: ${formatDate(warrant.woaEndDate)}\n` +
+            `สถานะ: ${warrant.arrestStatus || '-'}`,
+          wrap: true,
+          size: 'sm',
+          color: '#334155'
+        },
+
+        {
+          type: 'separator',
+          margin: 'md'
+        },
+
+        {
+          type: 'text',
+          text: '👨‍⚖️ ข้อมูลผู้เกี่ยวข้อง',
+          weight: 'bold',
+          size: 'md',
+          color: '#0F172A',
+          margin: 'md'
+        },
+
+        {
+          type: 'text',
+          text:
+            `ผู้พิพากษา: ${warrant.judgeName || '-'}\n` +
+            `โจทก์: ${warrant.plaintiff || '-'}`,
+          wrap: true,
+          size: 'sm',
+          color: '#334155'
+        }
+      ]
+    },
+
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '16px',
+      contents: [
+        {
+          type: 'button',
+          style: 'primary',
+          height: 'sm',
+          color: '#7F1D1D',
+
+          action: {
+            type: 'clipboard',
+            label: 'คัดลอกข้อมูล',
+            clipboardText: copyText
+          }
+        }
+      ]
+    }
+  };
+});
+
+const messages = [
+  {
+    type: 'flex',
+    altText: `ผลการตรวจสอบหมายจับศาล ${page + 1}/${totalPages}`,
+    contents: {
+      type: 'carousel',
+      contents: bubbles
     }
   }
+];
+
+if (totalPages > 1) {
+  messages.push({
+    type: 'text',
+    text:
+      `📄 หน้า ${page + 1}/${totalPages}\n` +
+      `พบทั้งหมด ${data.content.length} รายการ\n` +
+      `พิมพ์ doc#${accCardId} [1-${totalPages}] เพื่อดูหน้าอื่น`
+  });
+}
+
+return reply(event.replyToken, messages);
+
+    } else {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: 'ไม่พบข้อมูลหมายจับศาล'
+      });
+    }
+
+  } catch (err) {
+    console.log(
+      'doc# error:',
+      err?.response?.data || err.message
+    );
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ER ระบบปรับปรุงชั่วคราว'
+    });
+  }
+}
 
   // ใบขับขี่: dl#เลขบัตร
-  if (text.startsWith('dl#')) {
-    const cid = text.replace(/^dl#/, '').trim();
-    if (!cid) return reply(event.replyToken, { type: 'text', text: '❌กรุณาระบุเลขบัตรประชาชน เช่น dl#1234567890123' });
-    try {
-      const res = await fetchSearchApiRaw({ dl: cid });
-      if (!res.success) return reply(event.replyToken, { type: 'text', text: `❌ ${res.message || 'ดึงข้อมูลไม่สำเร็จ'}` });
-      const data = res.data;
-      if (data.content && data.content.length > 0) {
-        let result = `🔎ข้อมูลใบขับขี่\n- - - - - - - - - - - - -\n`;
-        data.content.forEach((license, idx) => {
-          result += `\n📄ใบขับขี่ที่${idx + 1}\n👤ชื่อ:${license.fullName}\n🆔เลขบัตร:${license.citizenCardNumber}\n🪪ประเภทใบขับขี่: ${license.type}\n📝 เลขที่ใบขับขี่: ${license.licenseNumber}\n📅 วันที่ออกใบอนุญาต: ${new Date(license.licenseIssueDate).toLocaleDateString('th-TH')}\n📅 วันที่หมดอายุ: ${new Date(license.licenseExpirationDate).toLocaleDateString('th-TH')}\n⭐ สถานะ: ${license.status}\n🏠 ที่อยู่: ${license.address}\n-------------------`;
-        });
-        result += `\n📊พบข้อมูลทั้งหมด ${data.totalElements} รายการ`;
-        return reply(event.replyToken, { type: 'text', text: result });
-      } else {
-        return reply(event.replyToken, { type: 'text', text: 'ไม่พบข้อมูลใบขับขี่' });
-      }
-    } catch (err) {
-      return reply(event.replyToken, { type: 'text', text: '❌ดึงข้อมูลใบขับขี่ไม่สำเร็จ' });
-    }
+if (text.startsWith('dl#')) {
+
+  const cid = text.replace(/^dl#/, '').trim();
+
+  if (!cid) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌กรุณาระบุเลขบัตรประชาชน เช่น dl#1234567890123'
+    });
   }
+
+  try {
+
+    const res = await fetchSearchApiRaw(
+      { dl: cid },
+      SECURE_SEARCH_API_BASE
+    );
+
+    if (!res.success) {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: `❌ ${res.message || '❌ER ระบบปรับปรุงชั่วคราว'}`
+      });
+    }
+
+    const data = res.data;
+
+    if (data.content && data.content.length > 0) {
+
+      // เลขลำดับแบบ Emoji
+      const numberEmoji = [
+        '1️⃣',
+        '2️⃣',
+        '3️⃣',
+        '4️⃣',
+        '5️⃣',
+        '6️⃣',
+        '7️⃣',
+        '8️⃣',
+        '9️⃣',
+        '🔟'
+      ];
+
+      // แปลงวันที่เป็น DD/MM/YYYY ค.ศ.
+      const formatDate = (value) => {
+
+        if (!value) return '-';
+
+        const date = new Date(value);
+
+        if (isNaN(date.getTime())) {
+          return '-';
+        }
+
+        return date.toLocaleDateString('en-GB', {
+          timeZone: 'Asia/Bangkok',
+          day: '2-digit',
+          month: '2-digit',
+          year: 'numeric'
+        });
+      };
+
+      // ใช้ข้อมูลบุคคลจากรายการแรก
+      const firstLicense = data.content[0];
+
+const bubbles = data.content
+  .slice(0, 10)
+  .map((license, idx) => {
+
+    const issueDate = formatDate(
+      license.licenseIssueDate || license.issueDate
+    );
+
+    const expirationDate = formatDate(
+      license.licenseExpirationDate || license.expirationDate
+    );
+
+    const copyText =
+      `🚘 ข้อมูลใบอนุญาตขับขี่\n` +
+      `ID: ${license.citizenCardNumber || cid}\n` +
+      `ชื่อ: ${license.fullName || '-'}\n\n` +
+      `ประเภท: ${license.type || '-'}\n` +
+      `เลขที่ใบอนุญาต: ${license.licenseNumber || '-'}\n` +
+      `สถานะ: ${license.status || '-'}\n` +
+      `สาขา: ${license.officeBranch || '-'}\n` +
+      `รหัสสาขา: ${license.officeBranchCode || '-'}\n` +
+      `วันที่ออก: ${issueDate}\n` +
+      `วันหมดอายุ: ${expirationDate}`;
+
+    return {
+      type: 'bubble',
+      size: 'mega',
+
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#0F172A',
+        paddingAll: '18px',
+        contents: [
+          {
+            type: 'text',
+            text: `🚘 ใบอนุญาตขับขี่ ${idx + 1}`,
+            color: '#FFFFFF',
+            weight: 'bold',
+            size: 'lg'
+          },
+          {
+            type: 'text',
+            text: license.licenseNumber || '-',
+            color: '#38BDF8',
+            weight: 'bold',
+            size: 'xl',
+            margin: 'sm'
+          }
+        ]
+      },
+
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: '18px',
+        spacing: 'md',
+        contents: [
+          {
+            type: 'text',
+            text: '👤 ข้อมูลบุคคล',
+            weight: 'bold',
+            size: 'md',
+            color: '#0F172A'
+          },
+          {
+            type: 'text',
+            text:
+              `ID: ${license.citizenCardNumber || cid}\n` +
+              `ชื่อ: ${license.fullName || '-'}`,
+            wrap: true,
+            size: 'sm',
+            color: '#334155'
+          },
+
+          {
+            type: 'separator',
+            margin: 'md'
+          },
+
+          {
+            type: 'text',
+            text: '🪪 ข้อมูลใบอนุญาต',
+            weight: 'bold',
+            size: 'md',
+            color: '#0F172A',
+            margin: 'md'
+          },
+          {
+            type: 'text',
+            text:
+              `ประเภท: ${license.type || '-'}\n` +
+              `เลขที่ใบอนุญาต: ${license.licenseNumber || '-'}\n` +
+              `สถานะ: ${license.status || '-'}\n` +
+              `สาขา: ${license.officeBranch || '-'}\n` +
+              `รหัสสาขา: ${license.officeBranchCode || '-'}\n` +
+              `วันที่ออก: ${issueDate}\n` +
+              `วันหมดอายุ: ${expirationDate}`,
+            wrap: true,
+            size: 'sm',
+            color: '#334155'
+          }
+        ]
+      },
+
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: '16px',
+        contents: [
+          {
+            type: 'button',
+            style: 'primary',
+            height: 'sm',
+            color: '#0F172A',
+            action: {
+              type: 'clipboard',
+              label: 'คัดลอกข้อมูล',
+              clipboardText: copyText
+            }
+          }
+        ]
+      }
+    };
+  });
+
+return reply(event.replyToken, {
+  type: 'flex',
+  altText: `ข้อมูลใบอนุญาตขับขี่ ${data.totalElements || data.content.length} รายการ`,
+  contents: {
+    type: 'carousel',
+    contents: bubbles
+  }
+});
+
+    } else {
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text: 'ไม่พบข้อมูลใบขับขี่'
+      });
+
+    }
+
+  } catch (err) {
+
+    console.log('dl# error:', err.message);
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ER ระบบปรับปรุงชั่วคราว'
+    });
+
+  }
+}
 
   // คุมประพฤติ: pb%เลขบัตร
   if (text.startsWith('pb%')) {
@@ -7913,7 +30824,7 @@ https://line.me/ti/p/mVmD-ncfvU
       return reply(event.replyToken, { type: 'text', text: '❌กรุณาระบุเลขบัตรประชาชน 13 หลัก เช่น pb%3100502131342' });
     }
     try {
-      const res = await fetchPEAApiFull({ pb: citizenId });
+      const res = await fetchPEAApiFull({ pb: citizenId }, SECURE_SEARCH_API_BASE);
       return reply(event.replyToken, { type: 'text', text: res.message || '❌ไม่พบข้อมูลคุมประพฤติ' });
     } catch (err) {
       console.error('pb error:', err?.response?.data || err.message);
@@ -7932,8 +30843,8 @@ https://line.me/ti/p/mVmD-ncfvU
     let page = parts[1] ? parseInt(parts[1], 10) - 1 : 0;
     if (!cid) return reply(event.replyToken, { type: 'text', text: '❌ กรุณาระบุเลขบัตรประชาชน เช่น cid#1234567890123' });
     try {
-      const res = await fetchSearchApiRaw({ cid });
-      if (!res.success) return reply(event.replyToken, { type: 'text', text: `❌ ${res.message || 'ดึงข้อมูลไม่สำเร็จ'}` });
+      const res = await fetchSearchApiRaw({ cid }, SECURE_SEARCH_API_BASE);
+      if (!res.success) return reply(event.replyToken, { type: 'text', text: `❌ ${res.message || '❌ER ระบบปรับปรุงชั่วคราว'}` });
       const data = res.data;
       if (data.content && data.content.length > 0) {
         const itemsPerPage = 2;
@@ -7945,13 +30856,35 @@ https://line.me/ti/p/mVmD-ncfvU
         const startIndex = page * itemsPerPage;
         const pageItems = data.content.slice(startIndex, Math.min(startIndex + itemsPerPage, data.content.length));
         let result = `🚗ข้อมูลทะเบียนรถ (จาก CID) หน้า ${page + 1}/${totalPages}\n- - - - - - - - - - - - -\n`;
-        pageItems.forEach((vehicle, idx) => {
-          result += formatVehicleDetails(vehicle, startIndex + idx + 1);
-        });
-        result += `\n📊 พบทั้งหมด ${data.content.length} คัน`;
-        result += `\n📄 แสดง ${pageItems.length} คันในหน้านี้`;
-        if (totalPages > 1) result += `\nพิมพ์ cid#${cid} [หน้า] เพื่อดูหน้าอื่น`;
-        return reply(event.replyToken, { type: 'text', text: result });
+        const bubbles = pageItems.map((vehicle, idx) =>
+  formatVehicleDetailsFlex(
+    vehicle,
+    startIndex + idx + 1
+  )
+);
+
+const messages = [
+  {
+    type: 'flex',
+    altText: `ข้อมูลทะเบียนรถ พบ ${data.content.length} คัน`,
+    contents: {
+      type: 'carousel',
+      contents: bubbles
+    }
+  }
+];
+
+if (totalPages > 1) {
+  messages.push({
+    type: 'text',
+    text:
+      `📊 พบทั้งหมด ${data.content.length} คัน\n` +
+      `📄 หน้า ${page + 1}/${totalPages}\n` +
+      `พิมพ์ cid#${cid} [1-${totalPages}] เพื่อดูหน้าอื่น`
+  });
+}
+
+return reply(event.replyToken, messages);
       } else {
         return reply(event.replyToken, { type: 'text', text: 'ไม่พบข้อมูลทะเบียนรถ' });
       }
@@ -7976,7 +30909,7 @@ https://line.me/ti/p/mVmD-ncfvU
     const vehTypeRef = parts[3];
     let page = parts[4] ? parseInt(parts[4]) - 1 : 0;
     try {
-      const res = await fetchSearchApiRaw({ province, plate1, plate2, vehTypeRef });
+      const res = await fetchSearchApiRaw({ province, plate1, plate2, vehTypeRef }, SECURE_SEARCH_API_BASE);
       if (!res.success) return reply(event.replyToken, { type: 'text', text: `❌ ${res.message || 'ดึงข้อมูลไม่สำเร็จ'}` });
       const data = res.data;
       if (data.content && data.content.length > 0) {
@@ -7987,12 +30920,35 @@ https://line.me/ti/p/mVmD-ncfvU
         const startIndex = page * itemsPerPage;
         const pageItems = data.content.slice(startIndex, Math.min(startIndex + itemsPerPage, data.content.length));
         let result = `🚗 ข้อมูลทะเบียนรถ (หน้า ${page + 1}/${totalPages})\n- - - - - - - - - - - - -\n`;
-        pageItems.forEach((vehicle, idx) => {
-          result += formatVehicleDetails(vehicle, startIndex + idx + 1);
-        });
-        result += `\n📊 แสดง ${pageItems.length} จาก ${data.content.length} รายการ`;
-        if (totalPages > 1) result += `\nพิมพ์ car#${province} ${plate1} ${plate2} ${vehTypeRef} [หน้า] เพื่อดูหน้าอื่น`;
-        return reply(event.replyToken, { type: 'text', text: result });
+        const bubbles = pageItems.map((vehicle, idx) =>
+  formatVehicleDetailsFlex(
+    vehicle,
+    startIndex + idx + 1
+  )
+);
+
+const messages = [
+  {
+    type: 'flex',
+    altText: `ข้อมูลทะเบียนรถ พบ ${data.content.length} รายการ`,
+    contents: {
+      type: 'carousel',
+      contents: bubbles
+    }
+  }
+];
+
+if (totalPages > 1) {
+  messages.push({
+    type: 'text',
+    text:
+      `📊 พบทั้งหมด ${data.content.length} รายการ\n` +
+      `📄 หน้า ${page + 1}/${totalPages}\n` +
+      `พิมพ์ car#${province} ${plate1} ${plate2} ${vehTypeRef} [1-${totalPages}] เพื่อดูหน้าอื่น`
+  });
+}
+
+return reply(event.replyToken, messages);
       } else {
         return reply(event.replyToken, { type: 'text', text: 'ไม่พบข้อมูลทะเบียนรถ' });
       }
@@ -8005,17 +30961,57 @@ https://line.me/ti/p/mVmD-ncfvU
   }
 
   if (text.startsWith('h%')) {
-    const pidToSearch = text.replace(/^h%/, '').trim();
-    if (!/^\d{13}$/.test(pidToSearch)) {
-      return reply(event.replyToken, { type: 'text', text: '❌กรุณาระบุเลขบัตรประชาชน เช่น h%1234567890123' });
+  return reply(event.replyToken, {
+    type: 'text',
+    text:
+`💡คำสั่ง h% อยู่ระหว่างแก้ไข💡
+🙏ขออภัยอย่างสูงครับ🙏`
+  });
+}
+
+  if (text.startsWith('dbd%')) {
+    const juristicId = text.replace(/^dbd%/i, '').trim();
+    if (!/^\d{13}$/.test(juristicId)) {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌กรุณาระบุเลขนิติบุคคล 13 หลัก เช่น dbd%0125538003824'
+      });
     }
     try {
-      const res = await fetchNhsoRightApi(pidToSearch);
-      const result = formatNhsoRightApiResult(res, pidToSearch);
-      return reply(event.replyToken, { type: 'text', text: result });
+      const res = await fetchDxcMessageApi({ dbd: juristicId }, SECURE_SEARCH_API_BASE);
+      return reply(event.replyToken, {
+        type: 'text',
+        text: limitLineMessage(res?.message || '❌ไม่พบข้อมูลจดทะเบียนนิติบุคคล')
+      });
     } catch (err) {
-      console.error('h% NHSO error:', err?.response?.data || err.message);
-      return reply(event.replyToken, { type: 'text', text: '❌ ดึงข้อมูลสิทธิ NHSO ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง' });
+      console.error('dbd% DXC error:', err?.response?.data || err.message);
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌ ดึงข้อมูลจดทะเบียนนิติบุคคลไม่สำเร็จ กรุณาลองใหม่อีกครั้ง'
+      });
+    }
+  }
+
+  if (text.startsWith('nb%')) {
+    const citizenId = text.replace(/^nb%/i, '').trim();
+    if (!/^\d{13}$/.test(citizenId)) {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌กรุณาระบุเลขบัตรประชาชน 13 หลัก เช่น nb%1100500640987'
+      });
+    }
+    try {
+      const res = await fetchDxcMessageApi({ nb: citizenId }, SECURE_SEARCH_API_BASE);
+      return reply(event.replyToken, {
+        type: 'text',
+        text: limitLineMessage(res?.message || '❌ไม่พบข้อมูลประวัติคดียาเสพติด')
+      });
+    } catch (err) {
+      console.error('nb% DXC error:', err?.response?.data || err.message);
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌ ดึงข้อมูลประวัติคดียาเสพติดไม่สำเร็จ กรุณาลองใหม่อีกครั้ง'
+      });
     }
   }
 
@@ -8028,17 +31024,114 @@ https://line.me/ti/p/mVmD-ncfvU
     return reply(event.replyToken, { type: 'text', text: result });
   }
 
-  if (text.startsWith('atm%')) {
-    const atmCode = text.replace(/^atm%/i, '').trim();
-    try {
-      const data = await fetchPEAApi({ atm: atmCode });
-      const result = formatKeyValueRows(data, `🏧 ข้อมูลตู้ ATM: ${atmCode}`);
-      return reply(event.replyToken, { type: 'text', text: result });
-    } catch (err) {
-      console.error('atm lookup error:', err?.response?.data || err.message);
-      return reply(event.replyToken, { type: 'text', text: '❌ดึงข้อมูล ATM ไม่สำเร็จ: ' + err.message });
-    }
+  if (
+  text
+    .toLowerCase()
+    .startsWith('atm%')
+) {
+
+  const keyword =
+    text
+      .replace(
+        /^atm%/i,
+        ''
+      )
+      .trim();
+
+
+  if (!keyword) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+
+        text:
+`❌ กรุณาระบุรหัสตู้ ATM
+
+ตัวอย่าง
+
+atm%0005
+
+หรือระบุธนาคาร
+
+atm%014/0005`
+      }
+    );
   }
+
+
+  try {
+
+    const results =
+      searchAtmDatabase(
+        keyword
+      );
+
+
+    const resultText =
+      formatAtmSearchResult(
+        results,
+        keyword
+      );
+
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text: resultText
+      }
+    );
+
+
+  } catch (err) {
+
+    console.error(
+      'ATM SEARCH ERROR:',
+      err
+    );
+
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text:
+          '❌ ระบบค้นหาตู้ ATM ขัดข้อง กรุณาลองใหม่อีกครั้ง'
+      }
+    );
+  }
+}
+
+if (text.startsWith('bn%')) {
+  const keyword = text.replace(/^bn%/, '').trim();
+
+  if (!keyword) {
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ กรุณาระบุชื่อธนาคารหรือรหัสธนาคาร\nตัวอย่าง: bn%กสิกร หรือ bn%0004'
+    });
+  }
+
+  try {
+    const data = await searchBankBOT(keyword);
+    const result = formatBankBOT(data, keyword);
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text: result
+    });
+
+  } catch (err) {
+    console.error('bn% BOT error:', err?.response?.data || err.message);
+
+    return reply(event.replyToken, {
+      type: 'text',
+      text: '❌ ไม่พบข้อมูล สืบค้นใหม่อีกครั้ง'
+    });
+  }
+}
 
 if (text.startsWith('#')) {
 
@@ -8128,17 +31221,96 @@ text: newText
     return reply(event.replyToken, { type: 'text', text: result });
   }
 
-  if (text.startsWith('wf%')) {
-    const citizenId = text.replace(/^wf%/i, '').trim();
-    if (!/^\d{13}$/.test(citizenId)) {
-      return reply(event.replyToken, { type: 'text', text: '❌กรุณาระบุเลขบัตร 13 หลัก เช่น wf%3460300290391' });
+  if (
+  text
+    .toLowerCase()
+    .startsWith('wf%')
+) {
+
+  const citizenId =
+    text
+      .replace(/^wf%/i, '')
+      .trim();
+
+
+  if (
+    !/^\d{13}$/.test(
+      citizenId
+    )
+  ) {
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+
+        text:
+`❌ กรุณาระบุเลขบัตรประชาชน 13 หลัก
+
+ตัวอย่าง
+wf%3460300290391`
+      }
+    );
+  }
+
+
+  try {
+
+    const html =
+      await fetchDlaWelfare(
+        citizenId
+      );
+
+
+    const result =
+      parseDlaWelfare(
+        html,
+        citizenId
+      );
+
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+        text: result
+      }
+    );
+
+
+  } catch (err) {
+
+    console.error(
+      'WF DLA ERROR:',
+      err?.response?.status,
+      err?.message
+    );
+
+
+    return reply(
+      event.replyToken,
+      {
+        type: 'text',
+
+        text:
+          '❌ ไม่สามารถตรวจสอบข้อมูลเบี้ยยังชีพได้ กรุณาลองใหม่อีกครั้ง'
+      }
+    );
+  }
+}
+
+  if (text.startsWith('kp%')) {
+    const id = text.replace(/^kp%/i, '').trim();
+    if (!id) {
+      return reply(event.replyToken, { type: 'text', text: '❌กรุณาระบุเลขบัตรหรือเลขสมาชิก\nตัวอย่าง: kp%5075018267' });
     }
     try {
-      const res = await fetchPEAApiFull({ wf: citizenId });
-      return reply(event.replyToken, { type: 'text', text: res.message || '❌ไม่พบข้อมูลของผู้มีสิทธิ์' });
+      const html = await fetchRtaMemberStatus(id);
+      const result = formatRtaMemberStatus(html, id);
+      return reply(event.replyToken, { type: 'text', text: result });
     } catch (err) {
-      console.error('wf error:', err?.response?.data || err.message);
-      return reply(event.replyToken, { type: 'text', text: '❌ตรวจสอบเบี้ยยังชีพไม่สำเร็จ: ' + err.message });
+      console.error('kp error:', err?.response?.data || err.message);
+      return reply(event.replyToken, { type: 'text', text: '❌ตรวจสอบสถานภาพสมาชิกไม่สำเร็จ: ' + err.message });
     }
   }
 
@@ -8284,13 +31456,17 @@ text: newText
       return reply(event.replyToken, { type: 'text', text: '❌กรุณาระบุเลขบัตรประชาชน เช่น psi#1234567890123' });
     }
     try {
-      const data = await fetchPrisonerApi({ psi: input });
-      const result = formatPrisonerRecords(data, input, false);
-      return reply(event.replyToken, { type: 'text', text: result });
+      const data = await fetchPrisonerApi({ psi: input }, SECURE_SEARCH_API_BASE);
+      const result = formatPrisonerRecordsFlex(data, input, false);
+return reply(event.replyToken, result);
     } catch (err) {
-      console.error('psi error:', err?.response?.data || err.message);
-      return reply(event.replyToken, { type: 'text', text: '❌ดึงข้อมูลผู้ต้องขังไม่สำเร็จ: ' + err.message });
-    }
+  console.error('psi error:', err?.response?.data || err.message);
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text: '❌ ไม่พบข้อมูล สืบค้นใหม่อีกครั้ง'
+  });
+}
   }
 
   if (text.startsWith('ps#')) {
@@ -8299,16 +31475,17 @@ text: newText
       return reply(event.replyToken, { type: 'text', text: '❌กรุณาระบุเลขบัตรประชาชน เช่น ps#1234567890123' });
     }
     try {
-      const data = await fetchPrisonerApi({ ps: input });
-      const result = formatPrisonerRecords(data, input, true);
-      return reply(event.replyToken, { type: 'text', text: result });
+      const data = await fetchPrisonerApi({ ps: input }, SECURE_SEARCH_API_BASE);
+      const result = formatPrisonerRecordsFlex(data, input, true);
+return reply(event.replyToken, result);
     } catch (err) {
-      console.error('ps error:', err?.response?.data || err.message);
-      return reply(event.replyToken, { 
-  type: 'text', 
-  text: '⌛กรุณาสืบค้นใหม่อีกครั้ง⌛'
-});
-    }
+  console.error('psi error:', err?.response?.data || err.message);
+
+  return reply(event.replyToken, {
+    type: 'text',
+    text: '❌ ไม่พบข้อมูล สืบค้นใหม่อีกครั้ง'
+  });
+}
   }
 
   if (text.startsWith('peab%')) {
@@ -8409,6 +31586,159 @@ text: newText
     }
   }
 
+  // 🔎 รวมผลจากคำสั่งย่อยทั้งหมด: all%เลขบัตร
+  if (text.startsWith('all%')) {
+    const pid = text.replace(/^all%/i, '').trim();
+    if (!/^\d{13}$/.test(pid)) {
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌ กรุณาระบุเลขบัตรประชาชน 13 หลัก เช่น all%1401000124449'
+      });
+    }
+
+    const run = (label, promise) => Promise.resolve(promise).then(data => ({ label, ok: true, data })).catch(error => {
+      console.error(`all% ${label} error:`, error?.response?.data || error.message);
+      return { label, ok: false, data: null };
+    });
+    const fetchAllDtac = async () => {
+      let lastError;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const response = await axios.get(
+            `https://dtac-api.jedi-r3cloud.org/dtac?phone=${encodeURIComponent(pid)}&token=jedi-api-2026`,
+            { timeout: 45000 }
+          );
+          return response.data;
+        } catch (error) {
+          lastError = error;
+          if (error?.response?.status !== 429 || attempt === 2) break;
+          const retryAfter = Number.parseFloat(error.response.data?.message?.match(/[\d.]+/)?.[0] || 3);
+          await new Promise(resolve => setTimeout(resolve, Math.min(retryAfter * 1000, 20000)));
+        }
+      }
+      throw lastError;
+    };
+
+    const [dtac, fiber, sso, installment, prisoner, warrant, crime, vehicle, license] = await Promise.all([
+      run('DTAC', fetchAllDtac()),
+      run('TRUE', fetchISMApi(pid)),
+      run('ประกันสังคม', fetchSearchApiRaw({ si: pid }, SECURE_SEARCH_API_BASE)),
+      run('ประวัติผ่อนสินค้า', fetchSiamInstallment(pid)),
+      run('ผู้ต้องขัง', fetchPrisonerApi({ psi: pid }, SECURE_SEARCH_API_BASE)),
+      run('หมายจับศาล', fetchSearchApiRaw({ doc: pid }, SECURE_SEARCH_API_BASE)),
+      run('หมายจับ CRIME', fetchCrime(pid)),
+      run('ครอบครองรถ', fetchSearchApiRaw({ cid: pid }, SECURE_SEARCH_API_BASE)),
+      run('ใบขับขี่', fetchSearchApiRaw({ dl: pid }, SECURE_SEARCH_API_BASE))
+    ]);
+
+    const section = (title, body) => `\n---------------\n${title}\n${body || '❌ ไม่พบข้อมูล'}`;
+    const rows = value => Array.isArray(value) ? value : [];
+    const firstOrLast = value => rows(value?.content || value?.data || value).slice(-1)[0];
+    const val = (item, ...keys) => {
+      for (const key of keys) {
+        if (item?.[key] !== undefined && item?.[key] !== null && String(item[key]).trim()) return String(item[key]).trim();
+      }
+      return '-';
+    };
+    const countText = value => {
+      const list = rows(value?.content || value?.data || value);
+      return list.length ? `✅ พบข้อมูล **${list.length} รายการ**` : '❌ ไม่พบข้อมูล';
+    };
+
+    let msg = `🔎 **PID : ${pid}**`;
+    const dtacRows = rows(dtac.data);
+    let dtacText = countText(dtac.data);
+    if (dtacRows.length) {
+      const name = val(dtacRows[0], 'name', 'fullname');
+      dtacText += `\n**ชื่อ:** ${name}\n`;
+      dtacRows.forEach((item, index) => {
+        dtacText += `${index + 1}️⃣ **${val(item, 'phone', 'mobile')}** — ✅ ${val(item, 'status', 'statusDesc') === '-' ? 'Active' : val(item, 'status', 'statusDesc')}\n`;
+      });
+    }
+    msg += section('## 📘 DTAC', dtac.ok ? dtacText : null);
+
+    const online = fiber.data?.onlineApi?.response?.data?.collection?.online;
+    const onlineRows = Array.isArray(online?.collectionList) ? online.collectionList : [];
+    let fiberText = onlineRows.length ? '' : '❌ ไม่พบข้อมูล';
+    if (onlineRows.length) {
+      fiberText = onlineRows.map(item => {
+        const address = item.address || {};
+        const addressText = typeof address === 'string'
+          ? address
+          : [address.line1, address.line2].filter(Boolean).join('\n');
+        return `* **BAN:** ${val(item, 'ban')}\n* **บริการ:** ${val(item, 'mobileNo')}\n* **สถานะ:** ${val(item, 'statusDesc', 'status')}\n**ที่อยู่ติดตั้ง**\n${addressText || '-'}`;
+      }).join('\n\n');
+    }
+    msg += section('## 📙 TRUE FIBER', fiber.ok ? fiberText : null);
+
+    const siData = sso.data?.data || sso.data;
+    const siRows = rows(siData?.content || siData?.data || siData);
+    const siLast = siRows[0];
+    let siText = countText(siData);
+    if (siLast) {
+      siText += `\n\n**รายการล่าสุด**\n* **บริษัท:** ${val(siLast, 'companyName', 'company', 'name')}\n* **รหัสสาขา:** ${val(siLast, 'accBran', 'branchCode')}\n* **สถานะ:** ${val(siLast, 'employStatusDesc', 'status')}`;
+    }
+    msg += section('## 👨‍🔧 ประกันสังคม', sso.ok ? `${siText}\n\n> แสดงเฉพาะรายการล่าสุด` : null);
+
+    const history = installment.data?.data?.installment_history || [];
+    const latestInstallment = history[0];
+    let installmentText = history.length ? `✅ พบข้อมูล **${history.length} รายการ**` : '❌ ไม่พบข้อมูล';
+    if (latestInstallment) {
+      const guarantor = latestInstallment.guarantor || {};
+      installmentText += `\n\n**รายการล่าสุด**\n* **เบอร์:** ${val(latestInstallment, 'phone')}\n* **เบอร์อื่น:** ${val(latestInstallment, 'other_phone')}\n* **วันที่เริ่มสัญญา:** ${val(latestInstallment, 'contract_start_date')}\n\n**ที่อยู่ลงสินค้า**\n${val(latestInstallment, 'current_address')}\n\n### 👤 ผู้ค้ำ\n* **ชื่อ:** ${val(guarantor, 'name')}\n* **เลขบัตร:** ${val(guarantor, 'id')}\n* **เบอร์:** ${val(guarantor, 'phone')}\n* **ความสัมพันธ์:** ${val(guarantor, 'relationship')}\n\n> แสดงเฉพาะรายการล่าสุด`;
+    }
+    msg += section('## 🛍️ ประวัติผ่อนสินค้า', installment.ok ? installmentText : null);
+
+    const warrantRows = rows(warrant.data?.data?.content || warrant.data?.data || warrant.data?.content || warrant.data);
+    const warrantText = warrantRows.length
+      ? `${countText(warrantRows)}\n\n${warrantRows.map((item, index) => `### ${index + 1}️⃣ หมายเลข ${val(item, 'woaNo')}/${val(item, 'woaYear')}\n* **ศาล:** ${val(item, 'courtCodeText', 'courtName')}\n* **สถานะ:** ${val(item, 'arrestStatus')}\n* **ข้อหา:** ${val(item, 'charge')}\n* **วันที่ออกหมาย:** ${val(item, 'woaDate')}\n* **สิ้นสุด:** ${val(item, 'woaEndDate')}`).join('\n\n')}`
+      : null;
+    msg += section('## 👮‍♂️ ข้อมูลผู้ต้องขัง', prisoner.ok ? formatPrisonerRecords(prisoner.data, pid, false) : null);
+    msg += section('## 🚨 หมายจับศาล', warrant.ok ? warrantText : null);
+    msg += section('## 📂 หมายจับ CRIME', crime.ok ? formatCrime(crime.data, pid) : null);
+    const vehicleRows = rows(vehicle.data?.data?.content || vehicle.data?.data || vehicle.data?.content || vehicle.data);
+    const vehicleText = vehicleRows.length
+      ? `✅ พบข้อมูล **${vehicleRows.length} รายการ**\n\n${vehicleRows.slice(0, 2).map((car, index) => `### ${index + 1}️⃣ ทะเบียน ${val(car, 'plate1')}${val(car, 'plate2')}\n* **สำนักงาน:** ${val(car, 'offLocDesc')}\n* **ยี่ห้อ:** ${val(car, 'brnDesc')}\n* **รุ่น:** ${val(car, 'modelName')}\n* **วันที่จดทะเบียน:** ${val(car, 'regDate')}\n* **วันหมดอายุ:** ${val(car, 'expDate')}\n* **ผู้ถือกรรมสิทธิ์:** ${val(car, 'owner1')}\n* **ผู้ครอบครอง:** ${val(car, 'owner2')}`).join('\n\n')}`
+      : null;
+      msg += section(
+  '## 👤 ฌาปนกิจสงเคราะห์',
+  '❌ ไม่พบข้อมูล'
+);
+
+msg += section(
+  '## 👨‍💼กรรมการบริษัท',
+  '❌ ไม่พบข้อมูล'
+);
+
+msg += section(
+  '## 🚍BUS',
+  '❌ ไม่พบข้อมูล'
+);
+
+msg += section(
+  '## 🚢กรมเจ้าท่า',
+  '❌ ไม่พบข้อมูล'
+);
+
+msg += section(
+  '## 🚇Railway',
+  '❌ ไม่พบข้อมูล'
+);
+    msg += section('## 🚗 ครอบครองรถ', vehicle.ok ? vehicleText : null);
+    const licenseRows = rows(license.data?.data?.content || license.data?.data || license.data?.content || license.data);
+    const dateOnly = value => {
+      const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+      return match ? `${match[3]}/${match[2]}/${match[1]}` : '-';
+    };
+    const licenseText = licenseRows.length
+      ? `✅ พบข้อมูล **${licenseRows.length} รายการ**\n\n${licenseRows.map((item, index) => `### ${index + 1}️⃣ ${val(item, 'type')}\n* เลขที่ใบอนุญาต: ${val(item, 'licenseNumber')}\n* สถานะ: ${val(item, 'status')}\n* สาขา: ${val(item, 'officeBranch')}\n* รหัสสาขา: ${val(item, 'officeBranchCode')}\n* วันที่ออก: ${dateOnly(item.licenseIssueDate)}\n* วันหมดอายุ: ${dateOnly(item.licenseExpirationDate)}`).join('\n\n')}`
+      : null;
+    msg += section('## 🪪 ใบอนุญาตขับขี่', license.ok ? licenseText : null);
+    msg += '\n---------------\n📌 **หากต้องการข้อมูลโดยละเอียด กรุณาสืบค้นแยกตามคำสั่ง**';
+
+    return reply(event.replyToken, { type: 'text', text: limitLineMessage(msg) });
+  }
+
   // 🔎 รวมข้อมูลจากเลขบัตร
   if (/^all%\d{13}$/.test(text)) {
     const pid = text.replace(/^all%/, '').trim();
@@ -8420,7 +31750,7 @@ await Promise.allSettled([
 
 searchJediHp(pid),
 fetchCrime(pid),
-fetchPEAApi({ si: pid }),
+fetchPEAApi({ si: pid }, SECURE_SEARCH_API_BASE),
 fetchInstallment(pid),
 
 axios.get(
@@ -8428,8 +31758,8 @@ axios.get(
 { timeout:45000 }
 ),
 
-fetchSearchApiRaw({ dl: pid }),
-fetchSearchApiRaw({ cid: pid })
+fetchSearchApiRaw({ dl: pid }, SECURE_SEARCH_API_BASE),
+fetchSearchApiRaw({ cid: pid }, SECURE_SEARCH_API_BASE)
 
 ]);
       const dData = dRes.status === 'fulfilled' ? dRes.value.data : null;
@@ -8731,22 +32061,58 @@ same
 การสืบสวนเท่านั้น !!`;
 }
 
-async function readPlateOcr(imagePath) {
-  const formData = new FormData();
+async function readPlateOcr(
+  imagePath,
+  originalName = 'plate.jpg',
+  mimeType = 'image/jpeg'
+) {
 
-  formData.append('file', fs.createReadStream(imagePath));
+  const formData =
+    new FormData();
 
-  const response = await axios.post(
-    'https://api.iapp.co.th/license-plate-recognition/file',
-    formData,
+
+  formData.append(
+    'file',
+    fs.createReadStream(
+      imagePath
+    ),
     {
-      headers: {
-        apikey: IAPP_API_KEY,
-        ...formData.getHeaders()
-      },
-      timeout: 60000
+      filename:
+        originalName ||
+        'plate.jpg',
+
+      contentType:
+        mimeType ||
+        'image/jpeg'
     }
   );
+
+
+  const response =
+    await axios.post(
+      'https://api.iapp.co.th/license-plate-recognition/file',
+
+      formData,
+
+      {
+        headers: {
+          apikey:
+            IAPP_API_KEY,
+
+          ...formData.getHeaders()
+        },
+
+        timeout:
+          60000,
+
+        maxContentLength:
+          Infinity,
+
+        maxBodyLength:
+          Infinity
+      }
+    );
+
 
   return response.data;
 }
@@ -8776,7 +32142,76 @@ async function handleImage(event) {
   const db = loadDB();
   const member = db.members[userId];
   const topup = db.topups?.[userId];
-  
+
+  // รับภาพหลักฐานของคำสั่ง base%
+  if (baseRequestSessions[userId]?.step === 'waiting_evidence') {
+    const session = baseRequestSessions[userId];
+
+    try {
+      const profile = await getProfile(userId);
+      const fileName = `base_${userId}_${Date.now()}.jpg`;
+      const savePath = path.join(UPLOAD_DIR, fileName);
+
+      await downloadLineImage(event.message.id, savePath);
+
+      const registeredName =
+        [member?.rank, member?.fullname].filter(Boolean).join(' ').trim() ||
+        member?.lineName ||
+        profile.displayName ||
+        '-';
+
+      const adminText =
+`🚨 รายการ BASE ใหม่
+
+📱 หมายเลขเป้าหมาย: ${session.phone || '-'}
+📡 เครือข่าย: ${session.network || '-'}
+📁 ชื่อเคส/คดี: ${session.caseName || '-'}
+👤 ข้อมูลเป้าหมาย: ${session.targetInfo || '-'}
+🪪 เลขบัตรเป้าหมาย: ${session.citizenId || '-'}
+
+━━━━━━━━━━━━━━
+👮 ข้อมูลผู้ขอ
+ชื่อ LINE: ${profile.displayName || '-'}
+ชื่อที่สมัคร: ${registeredName}
+เบอร์ที่สมัคร: ${member?.phone || '-'}
+ตำแหน่ง: ${member?.position || '-'}
+สังกัด: ${member?.department || '-'}
+UID: ${userId}
+เวลาส่ง: ${nowThai()}
+
+ตอบกลับสมาชิก:
+send#${userId}#ข้อความที่ต้องการส่ง`;
+
+      await notifyAdmins([
+        {
+          type: 'text',
+          text: limitLineMessage(adminText)
+        },
+        {
+          type: 'image',
+          originalContentUrl: `${BASE_URL}/uploads/${fileName}`,
+          previewImageUrl: `${BASE_URL}/uploads/${fileName}`
+        }
+      ]);
+
+      delete baseRequestSessions[userId];
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text:
+`✅ รับข้อมูลคำขอ BASE เรียบร้อยแล้ว
+ระบบได้รวบรวมข้อมูลและส่งให้แอดมินตรวจสอบแล้วครับ`
+      });
+    } catch (err) {
+      console.error('base evidence upload error:', err?.response?.data || err.message);
+
+      return reply(event.replyToken, {
+        type: 'text',
+        text: '❌ บันทึกภาพหลักฐานหรือแจ้งแอดมินไม่สำเร็จ กรุณาส่งรูปอีกครั้ง'
+      });
+    }
+  }
+
   if (supportSlipSessions[userId]?.step === 'waiting_slip') {
   try {
     const profile = await getProfile(userId);
@@ -8802,7 +32237,10 @@ async function handleImage(event) {
 ${profile.displayName || '-'}
 
 🆔 UID:
-${userId}`
+${userId}
+
+📱 เบอร์ที่ลงทะเบียน:
+${member?.phone || '-'}`
         },
         {
           type: 'image',
